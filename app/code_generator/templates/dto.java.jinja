@@ -1,0 +1,40 @@
+package {{ package_base }}.dto;
+
+{% for imp in entidad.imports %}
+{% if not imp.startswith('jakarta.persistence') %}
+import {{ imp }};
+{% endif %}
+{% endfor %}
+
+/**
+ * DTO generado por DevForge AI para la entidad {{ entidad.nombre_clase_java }}.
+ *
+ * Se usa para desacoplar la capa REST de las entidades JPA.
+ */
+public class {{ entidad.nombre_clase_java }}DTO {
+
+{% for campo in entidad.campos %}
+    private {{ campo.tipo_java }} {{ campo.nombre_java }};
+
+{% endfor %}
+
+    // ============================================================
+    // Constructores
+    // ============================================================
+    public {{ entidad.nombre_clase_java }}DTO() {
+    }
+
+    // ============================================================
+    // Getters y Setters
+    // ============================================================
+{% for campo in entidad.campos %}
+    public {{ campo.tipo_java }} get{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}() {
+        return {{ campo.nombre_java }};
+    }
+
+    public void set{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}({{ campo.tipo_java }} {{ campo.nombre_java }}) {
+        this.{{ campo.nombre_java }} = {{ campo.nombre_java }};
+    }
+
+{% endfor %}
+}

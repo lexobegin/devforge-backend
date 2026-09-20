@@ -1,0 +1,89 @@
+package {{ package_base }}.service;
+
+import {{ package_base }}.dto.{{ entidad.nombre_clase_java }}DTO;
+import {{ package_base }}.entity.{{ entidad.nombre_clase_java }};
+import {{ package_base }}.repository.{{ entidad.nombre_clase_java }}Repository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+/**
+ * Servicio generado por DevForge AI.
+ *
+ * Contiene la lógica de negocio básica (CRUD) para {{ entidad.nombre_clase_java }}.
+ * Los DTOs se usan en la frontera con el Controller.
+ */
+@Service
+public class {{ entidad.nombre_clase_java }}Service {
+
+    private final {{ entidad.nombre_clase_java }}Repository repository;
+
+    @Autowired
+    public {{ entidad.nombre_clase_java }}Service({{ entidad.nombre_clase_java }}Repository repository) {
+        this.repository = repository;
+    }
+
+    // ============================================================
+    // CRUD
+    // ============================================================
+    public List<{{ entidad.nombre_clase_java }}DTO> findAll() {
+        return repository.findAll()
+                .stream()
+                .map(this::toDTO)
+                .collect(Collectors.toList());
+    }
+
+    public Optional<{{ entidad.nombre_clase_java }}DTO> findById(Long id) {
+        return repository.findById(id).map(this::toDTO);
+    }
+
+    public {{ entidad.nombre_clase_java }}DTO create({{ entidad.nombre_clase_java }}DTO dto) {
+        {{ entidad.nombre_clase_java }} entity = toEntity(dto);
+        {{ entidad.nombre_clase_java }} saved = repository.save(entity);
+        return toDTO(saved);
+    }
+
+    public Optional<{{ entidad.nombre_clase_java }}DTO> update(Long id, {{ entidad.nombre_clase_java }}DTO dto) {
+        return repository.findById(id).map(existing -> {
+{% for campo in entidad.campos %}
+{% if not campo.es_clave_primaria %}
+            existing.set{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}(dto.get{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}());
+{% endif %}
+{% endfor %}
+            {{ entidad.nombre_clase_java }} updated = repository.save(existing);
+            return toDTO(updated);
+        });
+    }
+
+    public boolean delete(Long id) {
+        if (!repository.existsById(id)) {
+            return false;
+        }
+        repository.deleteById(id);
+        return true;
+    }
+
+    // ============================================================
+    // Mapeo DTO ↔ Entidad
+    // ============================================================
+    private {{ entidad.nombre_clase_java }}DTO toDTO({{ entidad.nombre_clase_java }} entity) {
+        {{ entidad.nombre_clase_java }}DTO dto = new {{ entidad.nombre_clase_java }}DTO();
+{% for campo in entidad.campos %}
+        dto.set{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}(entity.get{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}());
+{% endfor %}
+        return dto;
+    }
+
+    private {{ entidad.nombre_clase_java }} toEntity({{ entidad.nombre_clase_java }}DTO dto) {
+        {{ entidad.nombre_clase_java }} entity = new {{ entidad.nombre_clase_java }}();
+{% for campo in entidad.campos %}
+{% if not campo.es_clave_primaria %}
+        entity.set{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}(dto.get{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}());
+{% endif %}
+{% endfor %}
+        return entity;
+    }
+}

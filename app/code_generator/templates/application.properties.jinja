@@ -1,0 +1,25 @@
+# ============================================================
+# Backend generado por DevForge AI — trabajo #{{ trabajo_id }}
+# Diagrama: {{ diagrama_nombre }}
+# ============================================================
+
+spring.application.name={{ artifact }}
+
+# --- PostgreSQL ---
+spring.datasource.url=jdbc:postgresql://localhost:5432/{{ artifact }}_db
+spring.datasource.username=postgres
+spring.datasource.password=postgres
+spring.datasource.driver-class-name=org.postgresql.Driver
+
+# --- JPA / Hibernate ---
+spring.jpa.hibernate.ddl-auto=update
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
+spring.jpa.open-in-view=false
+
+# --- Servidor ---
+server.port=8080
+
+# --- Logging ---
+logging.level.org.hibernate.SQL=INFO

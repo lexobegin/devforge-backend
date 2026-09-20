@@ -1,0 +1,58 @@
+package {{ package_base }}.entity;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+{% for imp in entidad.imports %}
+{% if not imp.startswith('jakarta.persistence') %}
+import {{ imp }};
+{% endif %}
+{% endfor %}
+
+/**
+ * Entidad JPA generada por DevForge AI.
+ *
+ * Clase UML origen: {{ entidad.nombre_clase_java }}
+ * Tabla: {{ entidad.nombre_tabla }}
+ */
+@Entity
+@Table(name = "{{ entidad.nombre_tabla }}")
+public class {{ entidad.nombre_clase_java }} {
+
+{% for campo in entidad.campos %}
+{% if campo.es_clave_primaria %}
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "{{ campo.nombre_columna }}", nullable = false)
+    private {{ campo.tipo_java }} {{ campo.nombre_java }};
+
+{% else %}
+    @Column(name = "{{ campo.nombre_columna }}", nullable = {{ 'true' if campo.es_nulleable else 'false' }})
+    private {{ campo.tipo_java }} {{ campo.nombre_java }};
+
+{% endif %}
+{% endfor %}
+
+    // ============================================================
+    // Constructores
+    // ============================================================
+    public {{ entidad.nombre_clase_java }}() {
+    }
+
+    // ============================================================
+    // Getters y Setters
+    // ============================================================
+{% for campo in entidad.campos %}
+    public {{ campo.tipo_java }} get{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}() {
+        return {{ campo.nombre_java }};
+    }
+
+    public void set{{ campo.nombre_java[0]|upper }}{{ campo.nombre_java[1:] }}({{ campo.tipo_java }} {{ campo.nombre_java }}) {
+        this.{{ campo.nombre_java }} = {{ campo.nombre_java }};
+    }
+
+{% endfor %}
+}

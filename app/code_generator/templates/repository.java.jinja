@@ -1,0 +1,18 @@
+package {{ package_base }}.repository;
+
+import {{ package_base }}.entity.{{ entidad.nombre_clase_java }};
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+/**
+ * Repositorio JPA generado por DevForge AI.
+ *
+ * Tabla: {{ entidad.nombre_tabla }}
+ */
+@Repository
+public interface {{ entidad.nombre_clase_java }}Repository
+        extends JpaRepository<{{ entidad.nombre_clase_java }}, Long> {
+
+    // Métodos CRUD estándar ya provistos por JpaRepository.
+    // Agregar aquí queries derivadas si se necesitan.
+}

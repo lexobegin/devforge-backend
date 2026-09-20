@@ -1,0 +1,90 @@
+# ============================================================
+# DevForge AI — .gitignore (backend FastAPI + Python)
+# ============================================================
+
+# --- Entornos / secretos ---
+.env
+.env.*
+!.env.example
+!.env.produccion
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtualenvs ---
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# --- Testing / cobertura ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# --- Type checking / linters ---
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+
+# --- IDE / editores ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Alembic (no versionar archivos temporales) ---
+alembic/versions/*.py.tmp
+
+# --- Salidas del motor de generación automática ---
+# Cada trabajo de generación produce una carpeta autocontenida en generated_projects/.
+# No se versionan los artefactos; solo se conservan por runtime.
+generated_projects/*
+!generated_projects/.gitkeep
+
+# --- Archivos subidos / exportados ---
+uploads/*
+!uploads/.gitkeep
+exports/*
+!exports/.gitkeep
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Gunicorn / Nginx locales ---
+gunicorn.pid
+
+# --- OS ---
+Thumbs.db

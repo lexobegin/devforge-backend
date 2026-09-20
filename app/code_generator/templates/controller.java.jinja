@@ -1,0 +1,84 @@
+package {{ package_base }}.controller;
+
+import {{ package_base }}.dto.{{ entidad.nombre_clase_java }}DTO;
+import {{ package_base }}.service.{{ entidad.nombre_clase_java }}Service;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
+
+/**
+ * Controller REST generado por DevForge AI.
+ *
+ * Base URL: /api/{{ entidad.nombre_tabla }}
+ */
+@RestController
+@RequestMapping("/api/{{ entidad.nombre_tabla }}")
+public class {{ entidad.nombre_clase_java }}Controller {
+
+    private final {{ entidad.nombre_clase_java }}Service service;
+
+    @Autowired
+    public {{ entidad.nombre_clase_java }}Controller({{ entidad.nombre_clase_java }}Service service) {
+        this.service = service;
+    }
+
+    // ============================================================
+    // GET /api/{{ entidad.nombre_tabla }}
+    // ============================================================
+    @GetMapping
+    public ResponseEntity<List<{{ entidad.nombre_clase_java }}DTO>> findAll() {
+        return ResponseEntity.ok(service.findAll());
+    }
+
+    // ============================================================
+    // GET /api/{{ entidad.nombre_tabla }}/{id}
+    // ============================================================
+    @GetMapping("/{id}")
+    public ResponseEntity<{{ entidad.nombre_clase_java }}DTO> findById(@PathVariable Long id) {
+        return service.findById(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    // ============================================================
+    // POST /api/{{ entidad.nombre_tabla }}
+    // ============================================================
+    @PostMapping
+    public ResponseEntity<{{ entidad.nombre_clase_java }}DTO> create(@RequestBody {{ entidad.nombre_clase_java }}DTO dto) {
+        {{ entidad.nombre_clase_java }}DTO created = service.create(dto);
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
+    }
+
+    // ============================================================
+    // PUT /api/{{ entidad.nombre_tabla }}/{id}
+    // ============================================================
+    @PutMapping("/{id}")
+    public ResponseEntity<{{ entidad.nombre_clase_java }}DTO> update(
+            @PathVariable Long id,
+            @RequestBody {{ entidad.nombre_clase_java }}DTO dto) {
+        return service.update(id, dto)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    // ============================================================
+    // DELETE /api/{{ entidad.nombre_tabla }}/{id}
+    // ============================================================
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> delete(@PathVariable Long id) {
+        if (service.delete(id)) {
+            return ResponseEntity.noContent().build();
+        }
+        return ResponseEntity.notFound().build();
+    }
+}
