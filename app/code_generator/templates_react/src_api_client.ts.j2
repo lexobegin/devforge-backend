@@ -1,0 +1,23 @@
+// Generado por DevForge AI (CU24)
+// Punto ÚNICO para cambiar la URL del backend REST que consume el CRUD.
+// Por defecto apunta al backend DevForge (settings.BACKEND_PUBLIC_URL);
+// cámbiela si este frontend consume otro servidor (p. ej. el backend
+// Spring Boot generado del mismo proyecto).
+export const API_BASE = "{{ api_base_url }}";
+
+export async function apiFetch<T>(
+  ruta: string,
+  opciones: RequestInit = {}
+): Promise<T> {
+  const respuesta = await fetch(`${API_BASE}${ruta}`, {
+    headers: { "Content-Type": "application/json" },
+    ...opciones,
+  });
+  if (!respuesta.ok) {
+    throw new Error(`Error ${respuesta.status} en ${ruta}`);
+  }
+  if (respuesta.status === 204) {
+    return undefined as T;
+  }
+  return (await respuesta.json()) as T;
+}

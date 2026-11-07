@@ -3,255 +3,272 @@
 Repositorio de acceso a datos del módulo B. Colaboración.
 
 Incluye dos repositorios:
-- SesionColaboracionRepository     → tabla `sesiones_colaboracion`
-- ParticipanteSesionRepository     → tabla `participantes_sesion`
+- SesionColaboracionRepository → colección `sesiones_colaboracion`
+- ParticipanteSesionRepository → participantes EMBEBIDOS en
+                                 SesionColaboracion.participantes
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Ya no recibe AsyncSession: repositorios SIN ESTADO (la conexión la lleva
+  Beanie tras app/mongo.init_db()).
+- La tabla participantes_sesion desapareció: cada participante va EMBEBIDO
+  en su sesión. Consecuencias en ParticipanteSesionRepository:
+    * Los participantes ya NO tienen id propio: la clave es el par
+      (sesión, id_usuario); get_by_id se retira.
+    * Toda ESCRITURA recibe la SesionColaboracion RE-LEÍDA de la base,
+      modifica su lista `participantes` y la guarda (regla
+      fetch→modificar→save de Beanie).
+    * get_by_id(con_participantes=True) ya no necesita selectinload: leer
+      la sesión SIEMPRE trae sus participantes (el parámetro se retiró).
+- list_conectados_by_diagrama ya no hace JOIN sesiones × participantes:
+  se leen las sesiones activas y se filtran sus embebidos.
+- cerrar_todas_by_diagrama usa UN update_many de MongoDB en lugar del
+  bucle de flush del Ciclo 1.
+- Las horas se generan con datetime.now(timezone.utc) (conscientes, igual
+  que los default_factory de los modelos del Ciclo 2; el utcnow() naive
+  del Ciclo 1 mezclaba zonas con los datetime de Mongo).
 """
 
-from datetime import datetime
-from typing import Optional, Sequence
+from datetime import datetime, timezone
+from typing import Any, Optional, Sequence
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from beanie import PydanticObjectId
 
 from app.models.colaboracion import ParticipanteSesion, SesionColaboracion
+
+
+def _ahora(cuando: Optional[datetime] = None) -> datetime:
+    """Fecha de trabajo aware; permite inyectar `cuando` en tests/cierres."""
+    return cuando or datetime.now(timezone.utc)
 
 
 # ======================================================================
 # SesionColaboracionRepository
 # ======================================================================
 class SesionColaboracionRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
     async def get_by_id(
-        self,
-        sesion_id: int,
-        *,
-        con_participantes: bool = False,
+        self, sesion_id: PydanticObjectId
     ) -> Optional[SesionColaboracion]:
-        stmt = select(SesionColaboracion).where(SesionColaboracion.id == sesion_id)
-        if con_participantes:
-            stmt = stmt.options(selectinload(SesionColaboracion.participantes))
-        result = await self.db.execute(stmt)
-        return result.scalar_one_or_none()
+        """Los participantes SIEMPRE vienen embebidos (antes
+        con_participantes=True)."""
+        return await SesionColaboracion.get(sesion_id)
 
     async def get_sesion_activa_by_diagrama(
-        self, diagrama_id: int
+        self, diagrama_id: PydanticObjectId
     ) -> Optional[SesionColaboracion]:
         """
-        Devuelve la sesión activa (ended_at IS NULL) de un diagrama.
+        Devuelve la sesión activa (ended_at nulo) de un diagrama.
         Un diagrama debería tener a lo sumo una sesión activa a la vez.
         """
-        result = await self.db.execute(
-            select(SesionColaboracion)
-            .where(
+        return await (
+            SesionColaboracion.find(
                 SesionColaboracion.id_diagrama == diagrama_id,
-                SesionColaboracion.ended_at.is_(None),
+                SesionColaboracion.ended_at == None,  # noqa: E711 (Mongo: null)
             )
-            .order_by(SesionColaboracion.started_at.desc())
-            .limit(1)
+            .sort(-SesionColaboracion.started_at)
+            .first_or_none()
         )
-        return result.scalar_one_or_none()
 
     async def list_activas_by_proyecto(
-        self, proyecto_id: int
+        self, proyecto_id: PydanticObjectId
     ) -> Sequence[SesionColaboracion]:
-        result = await self.db.execute(
-            select(SesionColaboracion)
-            .where(
+        return await (
+            SesionColaboracion.find(
                 SesionColaboracion.id_proyecto == proyecto_id,
-                SesionColaboracion.ended_at.is_(None),
+                SesionColaboracion.ended_at == None,  # noqa: E711 (Mongo: null)
             )
-            .order_by(SesionColaboracion.started_at.desc())
+            .sort(-SesionColaboracion.started_at)
+            .to_list()
         )
-        return result.scalars().all()
 
     async def list_by_diagrama(
         self,
-        diagrama_id: int,
+        diagrama_id: PydanticObjectId,
         *,
         skip: int = 0,
         limit: int = 50,
     ) -> Sequence[SesionColaboracion]:
-        result = await self.db.execute(
-            select(SesionColaboracion)
-            .where(SesionColaboracion.id_diagrama == diagrama_id)
-            .order_by(SesionColaboracion.started_at.desc())
-            .offset(skip)
+        return await (
+            SesionColaboracion.find(
+                SesionColaboracion.id_diagrama == diagrama_id
+            )
+            .sort(-SesionColaboracion.started_at)
+            .skip(skip)
             .limit(limit)
+            .to_list()
         )
-        return result.scalars().all()
 
     # ------------------------------------------------------------------
     # Escrituras
     # ------------------------------------------------------------------
-    async def create(self, sesion: SesionColaboracion) -> SesionColaboracion:
-        self.db.add(sesion)
-        await self.db.flush()
-        await self.db.refresh(sesion)
+    async def create(
+        self, sesion: SesionColaboracion
+    ) -> SesionColaboracion:
+        await sesion.insert()
         return sesion
 
-    async def update(self, sesion: SesionColaboracion) -> SesionColaboracion:
-        await self.db.flush()
-        await self.db.refresh(sesion)
+    async def update(
+        self, sesion: SesionColaboracion
+    ) -> SesionColaboracion:
+        await sesion.save()
         return sesion
 
     async def cerrar_sesion(
-        self, sesion_id: int, *, cuando: Optional[datetime] = None
+        self,
+        sesion_id: PydanticObjectId,
+        *,
+        cuando: Optional[datetime] = None,
     ) -> Optional[SesionColaboracion]:
         """Marca `ended_at` en la sesión (la cierra)."""
         sesion = await self.get_by_id(sesion_id)
         if sesion is None:
             return None
-        sesion.ended_at = cuando or datetime.utcnow()
-        await self.db.flush()
-        await self.db.refresh(sesion)
+        sesion.ended_at = _ahora(cuando)
+        await sesion.save()
         return sesion
 
     async def cerrar_todas_by_diagrama(
-        self, diagrama_id: int, *, cuando: Optional[datetime] = None
+        self,
+        diagrama_id: PydanticObjectId,
+        *,
+        cuando: Optional[datetime] = None,
     ) -> int:
         """
-        Cierra todas las sesiones activas de un diagrama.
-        Devuelve cuántas cerró. Útil cuando se archiva/elimina un diagrama.
+        Cierra todas las sesiones activas de un diagrama con UN
+        update_many. Devuelve cuántas cerró. Útil cuando se archiva o
+        elimina un diagrama.
         """
-        sesiones = await self.list_by_diagrama(diagrama_id, limit=1000)
-        cerradas = 0
-        now = cuando or datetime.utcnow()
-        for s in sesiones:
-            if s.ended_at is None:
-                s.ended_at = now
-                cerradas += 1
-        if cerradas:
-            await self.db.flush()
-        return cerradas
+        resultado = await SesionColaboracion.find(
+            SesionColaboracion.id_diagrama == diagrama_id,
+            SesionColaboracion.ended_at == None,  # noqa: E711 (Mongo: null)
+        ).update({"$set": {"ended_at": _ahora(cuando)}})
+        return int(getattr(resultado, "modified_count", 0) or 0)
 
 
 # ======================================================================
-# ParticipanteSesionRepository
+# ParticipanteSesionRepository (embebidos en SesionColaboracion)
 # ======================================================================
 class ParticipanteSesionRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
+    """
+    Operaciones sobre los participantes EMBEBIDOS de una sesión. En el
+    Ciclo 1 cada método recibía/devolvía filas de participantes_sesion;
+    en el Ciclo 2 la unidad de persistencia es la SESIÓN: los métodos de
+    escritura reciben la SesionColaboracion re-leída de la base, modifican
+    su lista `participantes` y la guardan.
+    """
 
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
-    async def get_by_id(self, participante_id: int) -> Optional[ParticipanteSesion]:
-        result = await self.db.execute(
-            select(ParticipanteSesion).where(ParticipanteSesion.id == participante_id)
-        )
-        return result.scalar_one_or_none()
-
     async def get_by_sesion_usuario(
-        self, sesion_id: int, usuario_id: int
+        self,
+        sesion_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
     ) -> Optional[ParticipanteSesion]:
-        result = await self.db.execute(
-            select(ParticipanteSesion).where(
-                ParticipanteSesion.id_sesion == sesion_id,
-                ParticipanteSesion.id_usuario == usuario_id,
-            )
-        )
-        return result.scalar_one_or_none()
+        sesion = await SesionColaboracion.get(sesion_id)
+        if sesion is None:
+            return None
+        return sesion.participante(usuario_id)
 
     async def list_conectados_by_sesion(
-        self, sesion_id: int
+        self, sesion_id: PydanticObjectId
     ) -> Sequence[ParticipanteSesion]:
-        """Participantes que siguen conectados (left_at IS NULL)."""
-        result = await self.db.execute(
-            select(ParticipanteSesion)
-            .where(
-                ParticipanteSesion.id_sesion == sesion_id,
-                ParticipanteSesion.left_at.is_(None),
-            )
-            .order_by(ParticipanteSesion.joined_at.asc())
+        """Participantes que siguen conectados (left_at nulo), ordenados
+        por joined_at. (Antes una query con left_at IS NULL; ahora se
+        filtra la lista embebida de la sesión.)"""
+        sesion = await SesionColaboracion.get(sesion_id)
+        if sesion is None:
+            return []
+        return sorted(
+            (p for p in sesion.participantes if p.conectado),
+            key=lambda p: p.joined_at,
         )
-        return result.scalars().all()
 
-    async def count_conectados_by_sesion(self, sesion_id: int) -> int:
-        result = await self.db.execute(
-            select(func.count(ParticipanteSesion.id)).where(
-                ParticipanteSesion.id_sesion == sesion_id,
-                ParticipanteSesion.left_at.is_(None),
-            )
-        )
-        return int(result.scalar_one())
+    async def count_conectados_by_sesion(
+        self, sesion_id: PydanticObjectId
+    ) -> int:
+        conectados = await self.list_conectados_by_sesion(sesion_id)
+        return len(conectados)
 
     async def list_conectados_by_diagrama(
-        self, diagrama_id: int
+        self, diagrama_id: PydanticObjectId
     ) -> Sequence[ParticipanteSesion]:
         """
         Participantes conectados en cualquier sesión activa de un diagrama.
-        Útil para el panel de colaboradores del editor.
+        Útil para el panel de colaboradores del editor. (Sustituye al JOIN
+        sesiones × participantes del Ciclo 1.)
         """
-        result = await self.db.execute(
-            select(ParticipanteSesion)
-            .join(
-                SesionColaboracion,
-                SesionColaboracion.id == ParticipanteSesion.id_sesion,
-            )
-            .where(
-                SesionColaboracion.id_diagrama == diagrama_id,
-                SesionColaboracion.ended_at.is_(None),
-                ParticipanteSesion.left_at.is_(None),
-            )
-        )
-        return result.scalars().all()
+        sesiones = await SesionColaboracion.find(
+            SesionColaboracion.id_diagrama == diagrama_id,
+            SesionColaboracion.ended_at == None,  # noqa: E711 (Mongo: null)
+        ).to_list()
+        conectados = [
+            p
+            for sesion in sesiones
+            for p in sesion.participantes
+            if p.conectado
+        ]
+        return sorted(conectados, key=lambda p: p.joined_at)
 
     # ------------------------------------------------------------------
-    # Escrituras
+    # Escrituras (reciben la SesionColaboracion re-leída y la persisten)
     # ------------------------------------------------------------------
-    async def create(self, participante: ParticipanteSesion) -> ParticipanteSesion:
-        self.db.add(participante)
-        await self.db.flush()
-        await self.db.refresh(participante)
+    async def create(
+        self,
+        sesion: SesionColaboracion,
+        participante: ParticipanteSesion,
+    ) -> ParticipanteSesion:
+        sesion.participantes.append(participante)
+        await sesion.save()
         return participante
 
-    async def update(self, participante: ParticipanteSesion) -> ParticipanteSesion:
-        await self.db.flush()
-        await self.db.refresh(participante)
+    async def update(
+        self,
+        sesion: SesionColaboracion,
+        participante: ParticipanteSesion,
+    ) -> ParticipanteSesion:
+        await sesion.save()
         return participante
 
     async def actualizar_cursor(
         self,
-        participante_id: int,
-        posicion_cursor: Optional[dict],
-    ) -> Optional[ParticipanteSesion]:
-        """Actualiza solo el campo JSONB de posición de cursor."""
-        participante = await self.get_by_id(participante_id)
-        if participante is None:
-            return None
+        sesion: SesionColaboracion,
+        participante: ParticipanteSesion,
+        posicion_cursor: Optional[dict[str, Any]],
+    ) -> ParticipanteSesion:
+        """Actualiza solo el campo libre de posición del cursor (antes
+        JSONB): x, y, zoom y elemento enfocado, sin migraciones."""
         participante.posicion_cursor = posicion_cursor
-        await self.db.flush()
-        await self.db.refresh(participante)
+        await sesion.save()
         return participante
 
     async def marcar_salida(
-        self, participante_id: int, *, cuando: Optional[datetime] = None
-    ) -> Optional[ParticipanteSesion]:
+        self,
+        sesion: SesionColaboracion,
+        participante: ParticipanteSesion,
+        *,
+        cuando: Optional[datetime] = None,
+    ) -> ParticipanteSesion:
         """Marca `left_at` (el participante se desconectó)."""
-        participante = await self.get_by_id(participante_id)
-        if participante is None:
-            return None
-        participante.left_at = cuando or datetime.utcnow()
-        await self.db.flush()
-        await self.db.refresh(participante)
+        participante.left_at = _ahora(cuando)
+        await sesion.save()
         return participante
 
     async def marcar_salida_by_sesion_usuario(
         self,
-        sesion_id: int,
-        usuario_id: int,
+        sesion_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
         *,
         cuando: Optional[datetime] = None,
     ) -> bool:
-        participante = await self.get_by_sesion_usuario(sesion_id, usuario_id)
+        sesion = await SesionColaboracion.get(sesion_id)
+        if sesion is None:
+            return False
+        participante = sesion.participante(usuario_id)
         if participante is None:
             return False
-        participante.left_at = cuando or datetime.utcnow()
-        await self.db.flush()
+        participante.left_at = _ahora(cuando)
+        await sesion.save()
         return True

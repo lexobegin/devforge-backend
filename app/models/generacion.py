@@ -1,103 +1,154 @@
 # app/models/generacion.py
 """
-Modelos ORM del módulo F. Generación Automática de Backend (Spring Boot):
+Documentos del módulo F. Generación Automática de Código — CICLO 2.
 
-- TrabajoGeneracionCodigo → un proceso de generación automática de backend
-                            a partir de un diagrama.
+- TrabajoGeneracionCodigo → un proceso de generación automática a partir de
+                            un diagrama (colección "trabajos_generacion_codigo").
 - EntidadGenerada         → cada clase UML convertida en una entidad JPA/tabla
-                            dentro de un trabajo de generación.
+                            (EMBEDIDA en TrabajoGeneracionCodigo.entidades).
 - ReglaMapeo              → regla de mapeo de un atributo UML hacia una columna
-                            concreta de la tabla generada.
+                            concreta de la tabla generada (EMBEDIDA en
+                            EntidadGenerada.reglas_mapeo).
 
-Alineado 1:1 con el script SQL (módulo F).
+Cambios respecto al Ciclo 1 (tablas PostgreSQL → documentos MongoDB):
+- entidades_generadas y reglas_mapeo desaparecen como tablas: van EMBEBIDAS
+  en el trabajo (trabajo → entidades[] → reglas_mapeo[]). Leer el resultado
+  completo de una generación cuesta 1 consulta (antes 3 con joins) y el
+  resultado se elimina en cascada junto con el trabajo.
+- id_clase_uml e id_atributo_uml pasan de FK INT a STR uuid: referencian los
+  ids de los elementos EMBEBIDOS del Diagrama del Ciclo 2 (ClaseUML.id,
+  AtributoUML.id).
+- stack_destino sigue siendo texto libre: en el Ciclo 2 admite además el
+  frontend React (CU24), p. ej. "REACT_TS_VITE", junto al clásico
+  "SPRING_BOOT_JPA_POSTGRES".
+- Los productos generados SIGUEN siendo relacionales (Spring Boot + JPA +
+  PostgreSQL, GENERATED_BACKEND_* del config): lo único que cambia es dónde
+  se guarda la bitácora del trabajo.
+- Helpers esta_pendiente/esta_en_proceso/fue_exitoso/fallo se conservan.
+
+Nota de orden: ReglaMapeo se define antes que EntidadGenerada (pydantic
+resuelve las anotaciones en orden de declaración), igual que en diagrama.py.
 """
 
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Literal, Optional
 
-from sqlalchemy import (
-    Boolean,
-    CheckConstraint,
-    DateTime,
-    ForeignKey,
-    String,
-    func,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from beanie import Document, PydanticObjectId
+from pydantic import BaseModel, Field
 
-from app.database import Base
+# Literal que reemplaza al CHECK ck_trabajo_generacion_estado del Ciclo 1
+EstadoGeneracion = Literal["PENDIENTE", "EN_PROCESO", "EXITOSO", "FALLIDO"]
+
+
+# ======================================================================
+# ReglaMapeo (embebida)
+# ======================================================================
+class ReglaMapeo(BaseModel):  # embebido: los embebidos de Beanie son pydantic
+    """Mapeo atributo UML → columna SQL (antes tabla reglas_mapeo)."""
+
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla reglas_mapeo)
+    # ------------------------------------------------------------------
+    # id uuid del AtributoUML embebido del diagrama (antes FK a atributos_uml).
+    id_atributo_uml: str
+
+    # Nombre de la columna resultante (ej. "nombre_completo", "fecha_nacimiento").
+    nombre_columna: str
+
+    # Tipo SQL resultante del mapeo (VARCHAR(150), INTEGER, DATE, BOOLEAN…).
+    tipo_sql: str
+
+    es_clave_primaria: bool = False
+
+    es_nulleable: bool = True
+
+    def __repr__(self) -> str:
+        return (
+            f"<ReglaMapeo id={self.id_atributo_uml[:8]}… "
+            f"columna={self.nombre_columna!r} tipo_sql={self.tipo_sql!r}>"
+        )
+
+
+# ======================================================================
+# EntidadGenerada (embebida)
+# ======================================================================
+class EntidadGenerada(BaseModel):  # embebido: los embebidos de Beanie son pydantic
+    """Entidad JPA generada a partir de una clase UML (antes tabla
+    entidades_generadas)."""
+
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla entidades_generadas)
+    # ------------------------------------------------------------------
+    # id uuid del ClaseUML embebido del diagrama (antes FK a clases_uml).
+    id_clase_uml: str
+
+    # Nombre de la clase @Entity generada (ej. "Paciente", "HistoriaClinica").
+    nombre_clase_java: str
+
+    # Tabla Postgres resultante (ej. "paciente", "historia_clinica").
+    nombre_tabla: str
+
+    # Reglas EMBEBIDAS (antes tabla reglas_mapeo)
+    reglas_mapeo: list[ReglaMapeo] = Field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def regla_de_atributo(self, id_atributo_uml: str) -> Optional[ReglaMapeo]:
+        """Devuelve la regla de mapeo de un atributo UML (o None)."""
+        for regla in self.reglas_mapeo:
+            if regla.id_atributo_uml == id_atributo_uml:
+                return regla
+        return None
+
+    def __repr__(self) -> str:
+        return (
+            f"<EntidadGenerada java={self.nombre_clase_java!r} "
+            f"tabla={self.nombre_tabla!r}>"
+        )
 
 
 # ======================================================================
 # TrabajoGeneracionCodigo
 # ======================================================================
-class TrabajoGeneracionCodigo(Base):
-    __tablename__ = "trabajos_generacion_codigo"
-    __table_args__ = (
-        CheckConstraint(
-            "estado IN ('PENDIENTE','EN_PROCESO','EXITOSO','FALLIDO')",
-            name="ck_trabajo_generacion_estado",
-        ),
-    )
+class TrabajoGeneracionCodigo(Document):
+    """Trabajo de generación de código (colección
+    "trabajos_generacion_codigo")."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla trabajos_generacion_codigo)
+    # ------------------------------------------------------------------
+    id_diagrama: PydanticObjectId
 
-    id_diagrama: Mapped[int] = mapped_column(
-        ForeignKey("diagramas.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    id_usuario: PydanticObjectId
 
-    id_usuario: Mapped[int] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
+    stack_destino: str = "SPRING_BOOT_JPA_POSTGRES"
 
-    stack_destino: Mapped[str] = mapped_column(
-        String(30),
-        nullable=False,
-        default="SPRING_BOOT_JPA_POSTGRES",
-        server_default="SPRING_BOOT_JPA_POSTGRES",
-    )
+    estado: EstadoGeneracion = "PENDIENTE"
 
-    estado: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="PENDIENTE", server_default="PENDIENTE"
-    )
+    # Carpeta/zip donde queda el backend generado (relativo a
+    # GENERATED_PROJECTS_DIR).
+    ruta_salida: Optional[str] = None
 
-    # Carpeta/zip donde queda el backend generado (relativo a GENERATED_PROJECTS_DIR).
-    ruta_salida: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    started_at: Optional[datetime] = None
 
-    started_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=False), nullable=True
-    )
+    finished_at: Optional[datetime] = None
 
-    finished_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=False), nullable=True
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
     )
 
     # ------------------------------------------------------------------
-    # Relaciones
+    # Resultado EMBEBIDO (antes tablas entidades_generadas y reglas_mapeo)
     # ------------------------------------------------------------------
-    diagrama: Mapped["Diagrama"] = relationship(  # noqa: F821
-        "Diagrama",
-        foreign_keys=[id_diagrama],
-    )
+    entidades: list[EntidadGenerada] = Field(default_factory=list)
 
-    usuario: Mapped["Usuario"] = relationship(  # noqa: F821
-        "Usuario",
-        foreign_keys=[id_usuario],
-    )
-
-    entidades: Mapped[list["EntidadGenerada"]] = relationship(
-        "EntidadGenerada",
-        back_populates="trabajo",
-        cascade="all, delete-orphan",
-    )
+    # ------------------------------------------------------------------
+    # Configuración del documento
+    # ------------------------------------------------------------------
+    class Settings:
+        name = "trabajos_generacion_codigo"  # mismo nombre que la tabla
+        indexes = ["id_diagrama", "id_usuario"]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -118,112 +169,19 @@ class TrabajoGeneracionCodigo(Base):
     def fallo(self) -> bool:
         return self.estado == "FALLIDO"
 
-    def __repr__(self) -> str:
-        return (
-            f"<TrabajoGeneracionCodigo id={self.id} diagrama={self.id_diagrama} "
-            f"estado={self.estado!r}>"
-        )
+    def entidad_de_clase(self, id_clase_uml: str) -> Optional[EntidadGenerada]:
+        """Devuelve la entidad generada para una clase UML (o None).
 
-
-# ======================================================================
-# EntidadGenerada
-# ======================================================================
-class EntidadGenerada(Base):
-    __tablename__ = "entidades_generadas"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_trabajo: Mapped[int] = mapped_column(
-        ForeignKey("trabajos_generacion_codigo.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    id_clase_uml: Mapped[int] = mapped_column(
-        ForeignKey("clases_uml.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    # Nombre de la clase @Entity generada (ej. "Paciente", "HistoriaClinica").
-    nombre_clase_java: Mapped[str] = mapped_column(String(150), nullable=False)
-
-    # Tabla Postgres resultante (ej. "paciente", "historia_clinica").
-    nombre_tabla: Mapped[str] = mapped_column(String(150), nullable=False)
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    trabajo: Mapped["TrabajoGeneracionCodigo"] = relationship(
-        "TrabajoGeneracionCodigo", back_populates="entidades"
-    )
-
-    clase_uml: Mapped["ClaseUML"] = relationship(  # noqa: F821
-        "ClaseUML",
-        foreign_keys=[id_clase_uml],
-    )
-
-    reglas_mapeo: Mapped[list["ReglaMapeo"]] = relationship(
-        "ReglaMapeo",
-        back_populates="entidad_generada",
-        cascade="all, delete-orphan",
-    )
+        La usa el generador (CU6/CU24) para actualizar/consultar el
+        resultado por clase sin recorrer la lista a mano.
+        """
+        for entidad in self.entidades:
+            if entidad.id_clase_uml == id_clase_uml:
+                return entidad
+        return None
 
     def __repr__(self) -> str:
         return (
-            f"<EntidadGenerada id={self.id} java={self.nombre_clase_java!r} "
-            f"tabla={self.nombre_tabla!r}>"
-        )
-
-
-# ======================================================================
-# ReglaMapeo
-# ======================================================================
-class ReglaMapeo(Base):
-    __tablename__ = "reglas_mapeo"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_entidad_generada: Mapped[int] = mapped_column(
-        ForeignKey("entidades_generadas.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    id_atributo_uml: Mapped[int] = mapped_column(
-        ForeignKey("atributos_uml.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    # Nombre de la columna resultante (ej. "nombre_completo", "fecha_nacimiento").
-    nombre_columna: Mapped[str] = mapped_column(String(100), nullable=False)
-
-    # Tipo SQL resultante del mapeo (VARCHAR(150), INTEGER, DATE, BOOLEAN…).
-    tipo_sql: Mapped[str] = mapped_column(String(50), nullable=False)
-
-    es_clave_primaria: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
-
-    es_nulleable: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default="true"
-    )
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    entidad_generada: Mapped["EntidadGenerada"] = relationship(
-        "EntidadGenerada", back_populates="reglas_mapeo"
-    )
-
-    atributo_uml: Mapped["AtributoUML"] = relationship(  # noqa: F821
-        "AtributoUML",
-        foreign_keys=[id_atributo_uml],
-    )
-
-    def __repr__(self) -> str:
-        return (
-            f"<ReglaMapeo id={self.id} columna={self.nombre_columna!r} "
-            f"tipo_sql={self.tipo_sql!r}>"
+            f"<TrabajoGeneracionCodigo id={self.id} "
+            f"diagrama={self.id_diagrama} estado={self.estado!r}>"
         )

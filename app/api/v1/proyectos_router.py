@@ -1,6 +1,6 @@
 # app/api/v1/proyectos_router.py
 """
-Endpoints de gestión de proyectos y miembros (módulo B):
+Endpoints de gestión de proyectos y miembros (módulo B) — CICLO 2.
 
 Proyectos:
 - GET    /api/v1/proyectos                     → listar los del usuario
@@ -17,13 +17,17 @@ Miembros:
 - PUT    /api/v1/proyectos/{id}/miembros/{miembro_id}       → cambiar rol
 - DELETE /api/v1/proyectos/{id}/miembros/{miembro_id}       → quitar
 - POST   /api/v1/proyectos/{id}/transferir-propiedad        → transferir
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession; ids de ruta
+PydanticObjectId; la bitácora (log_proyecto_creado) se registra sin
+commit=True (insert autónomo); errores de dominio traducidos por
+app/core/exceptions.py.
 """
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.dependencies import get_current_active_user, require_admin
-from app.database import get_db
+from app.core.dependencies import get_current_active_user
 from app.models.usuario import Usuario
 from app.schemas.proyecto_schema import (
     MiembroProyectoCreate,
@@ -58,9 +62,8 @@ async def listar_proyectos(
     incluir_archivados: bool = Query(False),
     todos: bool = Query(False, description="Solo ADMIN: listar todos"),
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> dict:
-    service = ProyectoService(db)
+    service = ProyectoService()
 
     if todos and current_user.is_admin:
         items, total = await service.listar_todos(
@@ -92,14 +95,13 @@ async def listar_proyectos(
 async def crear_proyecto(
     datos: ProyectoCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ProyectoResponse:
-    service = ProyectoService(db)
+    service = ProyectoService()
     proyecto = await service.crear(datos, usuario_id=current_user.id)
 
-    auditoria = AuditoriaService(db)
+    auditoria = AuditoriaService()
     await auditoria.log_proyecto_creado(
-        proyecto.id, current_user.id, proyecto.nombre, commit=True
+        proyecto.id, current_user.id, proyecto.nombre
     )
 
     return proyecto
@@ -115,11 +117,10 @@ async def crear_proyecto(
     description="Incluye la lista de miembros del proyecto.",
 )
 async def obtener_proyecto(
-    proyecto_id: int,
+    proyecto_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = ProyectoService(db)
+    service = ProyectoService()
     return await service.obtener(
         proyecto_id,
         usuario_id=current_user.id,
@@ -138,12 +139,11 @@ async def obtener_proyecto(
     ),
 )
 async def actualizar_proyecto(
-    proyecto_id: int,
+    proyecto_id: PydanticObjectId,
     datos: ProyectoUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ProyectoResponse:
-    service = ProyectoService(db)
+    service = ProyectoService()
     return await service.actualizar(
         proyecto_id, datos, usuario_id=current_user.id
     )
@@ -155,11 +155,10 @@ async def actualizar_proyecto(
     summary="Archivar proyecto (solo PROPIETARIO)",
 )
 async def archivar_proyecto(
-    proyecto_id: int,
+    proyecto_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ProyectoResponse:
-    service = ProyectoService(db)
+    service = ProyectoService()
     return await service.archivar(proyecto_id, usuario_id=current_user.id)
 
 
@@ -169,11 +168,10 @@ async def archivar_proyecto(
     summary="Reactivar proyecto (solo PROPIETARIO)",
 )
 async def reactivar_proyecto(
-    proyecto_id: int,
+    proyecto_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ProyectoResponse:
-    service = ProyectoService(db)
+    service = ProyectoService()
     return await service.reactivar(proyecto_id, usuario_id=current_user.id)
 
 
@@ -181,14 +179,16 @@ async def reactivar_proyecto(
     "/{proyecto_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Eliminar proyecto (solo PROPIETARIO)",
-    description="Eliminación física en cascada de miembros, diagramas y datos asociados.",
+    description=(
+        "Eliminación en cascada de miembros, diagramas y datos asociados "
+        "(el service borra cada colección: MongoDB no tiene ON DELETE CASCADE)."
+    ),
 )
 async def eliminar_proyecto(
-    proyecto_id: int,
+    proyecto_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = ProyectoService(db)
+    service = ProyectoService()
     await service.eliminar(proyecto_id, usuario_id=current_user.id)
 
 
@@ -201,11 +201,10 @@ async def eliminar_proyecto(
     summary="Listar miembros del proyecto",
 )
 async def listar_miembros(
-    proyecto_id: int,
+    proyecto_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = ProyectoService(db)
+    service = ProyectoService()
     return await service.listar_miembros(proyecto_id, usuario_id=current_user.id)
 
 
@@ -220,12 +219,11 @@ async def listar_miembros(
     ),
 )
 async def agregar_miembro(
-    proyecto_id: int,
+    proyecto_id: PydanticObjectId,
     datos: MiembroProyectoCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> MiembroProyectoResponse:
-    service = ProyectoService(db)
+    service = ProyectoService()
     return await service.agregar_miembro(
         proyecto_id, datos, usuario_id=current_user.id
     )
@@ -237,13 +235,12 @@ async def agregar_miembro(
     summary="Cambiar rol de un miembro (solo PROPIETARIO)",
 )
 async def cambiar_rol_miembro(
-    proyecto_id: int,
-    miembro_id: int,
+    proyecto_id: PydanticObjectId,
+    miembro_id: PydanticObjectId,
     datos: MiembroProyectoUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> MiembroProyectoResponse:
-    service = ProyectoService(db)
+    service = ProyectoService()
     return await service.cambiar_rol_miembro(
         proyecto_id, miembro_id, datos, usuario_id=current_user.id
     )
@@ -259,12 +256,11 @@ async def cambiar_rol_miembro(
     ),
 )
 async def quitar_miembro(
-    proyecto_id: int,
-    miembro_id: int,
+    proyecto_id: PydanticObjectId,
+    miembro_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = ProyectoService(db)
+    service = ProyectoService()
     await service.quitar_miembro(
         proyecto_id, miembro_id, usuario_id=current_user.id
     )
@@ -280,12 +276,11 @@ async def quitar_miembro(
     ),
 )
 async def transferir_propiedad(
-    proyecto_id: int,
-    nuevo_propietario_id: int = Query(..., gt=0),
+    proyecto_id: PydanticObjectId,
+    nuevo_propietario_id: str = Query(..., description="ObjectId del nuevo propietario"),
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> MiembroProyectoResponse:
-    service = ProyectoService(db)
+    service = ProyectoService()
     return await service.transferir_propiedad(
         proyecto_id, nuevo_propietario_id, usuario_id=current_user.id
     )

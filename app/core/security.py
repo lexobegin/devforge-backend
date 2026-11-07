@@ -3,6 +3,17 @@
 Seguridad de DevForge AI:
 - Hash y verificación de contraseñas (bcrypt vía passlib).
 - Generación y validación de tokens JWT (access y refresh).
+
+RECONVERTIDO del Ciclo 1 (sustituye al provisional PyJWT+PBKDF2 del
+sandbox). ÚNICOS cambios del Ciclo 2, documentados:
+- `sub` pasa de int a str(usuario.id) (ObjectId en hex) porque los ids
+  int de PostgreSQL desaparecen; create_access_token/create_refresh_token
+  reciben el subject YA convertido a str (auth_service usa str(usuario.id)).
+- decode_token sigue lanzando JWTError de python-jose (igual que el
+  Ciclo 1): dependencies.py lo captura para responder 401, y
+  auth_service.refrescar_token lo envuelve en try/except.
+- Se conserva is_token_valid del Ciclo 1 (paridad de superficie; el
+  arnés la cubre).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -44,7 +55,7 @@ TOKEN_TYPE_REFRESH = "refresh"
 
 def _create_token(
     *,
-    subject: str | int,
+    subject: str,
     token_type: str,
     expires_delta: timedelta,
     extra_claims: Optional[Dict[str, Any]] = None,
@@ -52,7 +63,7 @@ def _create_token(
     """Función interna: construye y firma un JWT."""
     now = datetime.now(timezone.utc)
     payload: Dict[str, Any] = {
-        "sub": str(subject),
+        "sub": subject,          # CICLO 2: str(ObjectId del usuario)
         "type": token_type,
         "iat": int(now.timestamp()),
         "exp": int((now + expires_delta).timestamp()),
@@ -68,13 +79,13 @@ def _create_token(
 
 
 def create_access_token(
-    subject: str | int,
+    subject: str,
     *,
     extra_claims: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Genera un access token.
-    `subject` normalmente es el id del usuario.
+    `subject` es str(usuario.id) en el Ciclo 2 (antes el int del serial).
     `extra_claims` puede incluir rol, email, etc.
     """
     return _create_token(
@@ -85,7 +96,7 @@ def create_access_token(
     )
 
 
-def create_refresh_token(subject: str | int) -> str:
+def create_refresh_token(subject: str) -> str:
     """Genera un refresh token de larga duración."""
     return _create_token(
         subject=subject,
@@ -110,7 +121,7 @@ def is_token_valid(token: str, *, expected_type: Optional[str] = None) -> bool:
     """
     Verificación rápida. Devuelve True/False sin lanzar excepciones.
     Opcionalmente valida que el token sea de un tipo específico
-    ('access' o 'refresh').
+    ('access' o 'refresh'). Conservado del Ciclo 1.
     """
     try:
         payload = decode_token(token)

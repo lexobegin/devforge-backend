@@ -11,11 +11,25 @@ Cubre:
 - Limpieza de leídas.
 
 Regla: un usuario solo puede ver y modificar SUS PROPIAS notificaciones.
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Servicio SIN ESTADO: sin AsyncSession ni commit()/refresh(). Cada
+  create()/save()/delete() del repositorio persiste de inmediato, así
+  que el parámetro `commit` del Ciclo 1 DESAPARECE de crear() y de
+  crear_para_miembros_de_proyecto(): ya no hay transacción que diferir.
+- Ids: usuario_id/notificacion_id pasan de int a PydanticObjectId;
+  id_referencia pasa de BIGINT polimórfico a Optional[str] (str del
+  ObjectId de un documento o uuid de un elemento embebido, según
+  `tipo`), igual que ya viene alineado en NotificacionCreate del
+  Ciclo 2.
+- marcar_varias_leidas recibe list[PydanticObjectId] (el request del
+  router ya trae ids de Mongo) y el repositorio hace UN update con la
+  defensa por id_usuario incluida en la MISMA consulta ($in ≈ IN).
 """
 
 from typing import Optional, Sequence
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.models.notificacion import Notificacion
@@ -29,17 +43,16 @@ from app.schemas.notificacion_schema import (
 
 
 class NotificacionService:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-        self.notificaciones = NotificacionRepository(db)
-        self.miembros = MiembroProyectoRepository(db)
+    def __init__(self) -> None:
+        self.notificaciones = NotificacionRepository()
+        self.miembros = MiembroProyectoRepository()
 
     # ==================================================================
     # LECTURAS
     # ==================================================================
     async def listar(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         solo_no_leidas: bool = False,
         skip: int = 0,
@@ -55,7 +68,7 @@ class NotificacionService:
 
     async def listar_por_tipo(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         tipo: str,
         *,
         skip: int = 0,
@@ -67,13 +80,16 @@ class NotificacionService:
         return [NotificacionResponse.model_validate(n) for n in items]
 
     async def contar_no_leidas(
-        self, usuario_id: int
+        self, usuario_id: PydanticObjectId
     ) -> ContadorNoLeidasResponse:
         total = await self.notificaciones.count_no_leidas(usuario_id)
         return ContadorNoLeidasResponse(total_no_leidas=total)
 
     async def obtener(
-        self, notificacion_id: int, *, usuario_id: int
+        self,
+        notificacion_id: PydanticObjectId,
+        *,
+        usuario_id: PydanticObjectId,
     ) -> NotificacionResponse:
         notificacion = await self.notificaciones.get_by_id(notificacion_id)
         if notificacion is None:
@@ -85,15 +101,14 @@ class NotificacionService:
     # ==================================================================
     # CREACIÓN
     # ==================================================================
-    async def crear(
-        self, datos: NotificacionCreate, *, commit: bool = True
-    ) -> NotificacionResponse:
+    async def crear(self, datos: NotificacionCreate) -> NotificacionResponse:
         """
         Crea una notificación para un usuario concreto.
 
-        `commit=False` permite usarlo desde otros servicios (generación,
-        comentarios, etc.) dentro de una transacción mayor, dejando el
-        commit al llamador.
+        (En el Ciclo 1 tenía el parámetro `commit=False` para dejar el
+        commit en manos del servicio invocante dentro de una transacción
+        mayor; en el Ciclo 2 insert() ya persiste de inmediato, así que
+        no hay nada que diferir.)
         """
         notificacion = Notificacion(
             id_usuario=datos.id_usuario,
@@ -103,26 +118,25 @@ class NotificacionService:
             leida=False,
         )
         notificacion = await self.notificaciones.create(notificacion)
-        if commit:
-            await self.db.commit()
-            await self.db.refresh(notificacion)
         return NotificacionResponse.model_validate(notificacion)
 
     async def crear_para_miembros_de_proyecto(
         self,
-        proyecto_id: int,
+        proyecto_id: PydanticObjectId,
         *,
         tipo: str,
         mensaje: str,
-        id_referencia: Optional[int] = None,
-        excluir_usuario_id: Optional[int] = None,
-        commit: bool = True,
+        id_referencia: Optional[str] = None,
+        excluir_usuario_id: Optional[PydanticObjectId] = None,
     ) -> int:
         """
         Notifica a todos los miembros de un proyecto (opcionalmente
         excluyendo al que disparó el evento).
         Devuelve cuántas notificaciones se crearon.
         """
+        # El repositorio re-lee el Proyecto y devuelve los miembros
+        # EMBEBIDOS ordenados por joined_at (mismos objetos que el Ciclo 1,
+        # ahora sin id de fila: la clave es id_usuario).
         miembros = await self.miembros.list_by_proyecto(proyecto_id)
         if not miembros:
             return 0
@@ -144,16 +158,20 @@ class NotificacionService:
         if not notifs:
             return 0
 
+        # bulk_create es un bucle de insert(): cada uno asigna su ObjectId
+        # (el add_all + commit del Ciclo 1 ya no tiene equivalente).
         await self.notificaciones.bulk_create(notifs)
-        if commit:
-            await self.db.commit()
         return len(notifs)
 
     # ==================================================================
     # ACTUALIZACIÓN
     # ==================================================================
     async def marcar_leida(
-        self, notificacion_id: int, *, usuario_id: int, leida: bool = True
+        self,
+        notificacion_id: PydanticObjectId,
+        *,
+        usuario_id: PydanticObjectId,
+        leida: bool = True,
     ) -> NotificacionResponse:
         notificacion = await self.notificaciones.get_by_id(notificacion_id)
         if notificacion is None:
@@ -161,25 +179,25 @@ class NotificacionService:
         if notificacion.id_usuario != usuario_id:
             raise ForbiddenError("No puede modificar notificaciones de otro usuario")
 
+        # (El Ciclo 1 seguía con commit() + refresh(); el repositorio del
+        #  Ciclo 2 re-obtiene el documento, fija `leida` y hace save().)
         notificacion = await self.notificaciones.marcar_leida(
             notificacion_id, leida=leida
         )
-        await self.db.commit()
-        await self.db.refresh(notificacion)
         return NotificacionResponse.model_validate(notificacion)
 
     async def marcar_varias_leidas(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
-        ids: Optional[list[int]] = None,
+        ids: Optional[list[PydanticObjectId]] = None,
         todas: bool = False,
     ) -> int:
         """
         Marca varias notificaciones como leídas.
         - `todas=True` → todas las no leídas del usuario.
         - `ids=[...]` → solo esas (defensa por id_usuario en el repo).
-        Devuelve cuántas filas se actualizaron.
+        Devuelve cuántas se actualizaron.
         """
         if todas:
             actualizadas = await self.notificaciones.marcar_todas_leidas(usuario_id)
@@ -189,23 +207,24 @@ class NotificacionService:
             actualizadas = await self.notificaciones.marcar_varias_leidas(
                 usuario_id, ids
             )
-        await self.db.commit()
         return actualizadas
 
     # ==================================================================
     # ELIMINACIÓN
     # ==================================================================
-    async def eliminar(self, notificacion_id: int, *, usuario_id: int) -> None:
+    async def eliminar(
+        self,
+        notificacion_id: PydanticObjectId,
+        *,
+        usuario_id: PydanticObjectId,
+    ) -> None:
         notificacion = await self.notificaciones.get_by_id(notificacion_id)
         if notificacion is None:
             raise NotFoundError("Notificación no encontrada")
         if notificacion.id_usuario != usuario_id:
             raise ForbiddenError("No puede eliminar notificaciones de otro usuario")
         await self.notificaciones.delete(notificacion)
-        await self.db.commit()
 
-    async def limpiar_leidas(self, usuario_id: int) -> int:
+    async def limpiar_leidas(self, usuario_id: PydanticObjectId) -> int:
         """Borra todas las notificaciones ya leídas del usuario."""
-        eliminadas = await self.notificaciones.delete_leidas_by_usuario(usuario_id)
-        await self.db.commit()
-        return eliminadas
+        return await self.notificaciones.delete_leidas_by_usuario(usuario_id)

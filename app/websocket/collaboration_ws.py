@@ -18,18 +18,43 @@ Flujo:
 
 NO aplica cambios al modelo en BD: eso lo hace el cliente vía REST.
 El WS solo retransmite y notifica cambios ya persistidos.
+
+Migrado del Ciclo 1 (SQLAlchemy/AsyncSessionLocal → Beanie/MongoDB):
+- diagrama_id de la ruta es STR (ObjectId en hex): se convierte a
+  PydanticObjectId antes de consultar; un id malformado NO revienta
+  (500): cierra con 4404, igual que un diagrama inexistente.
+- _autenticar_usuario replica el patrón de core/dependencies.py (T19):
+  decode_token → type == "access" → PydanticObjectId(sub) con
+  try/except (el sub malformado es un token inválido, no un crash) →
+  Usuario.get() de Beanie. Sin `select()` ni AsyncSessionLocal.
+  NOTA DE REVISIÓN (arnés 19b): bson.errors.InvalidId NO es ValueError
+  en pymongo ≥ 4.x (hereda de BSONError), así que las cláusulas
+  incluyen InvalidId explícito — también corregido en dependencies.py,
+  auth_service.py y sincronizacion_service.py.
+- La membresía se consulta con MiembroProyectoRepository (repositorio
+  SIN estado de la Tanda 9): get_by_proyecto_usuario(diagrama.id_proyecto,
+  usuario.id). La conexión la lleva Beanie.
+- El id del usuario en el manager y en los mensajes es str(usuario.id)
+  (ObjectId hex): send_json usa json.dumps y no serializa ObjectId.
+- El registro en historial usa HistorialCambioRepository().create()
+  (insert autónomo de Beanie, SIN commit — regla de la Tanda 19) con
+  ids PydanticObjectId, id_entidad str uuid (elementos EMBEBIDOS del
+  Diagrama) y datos_cambio = payload del evento. Se conserva la política
+  del Ciclo 1: si el registro falla el WS NO se rompe (solo se loguea),
+  y sin id_entidad en el payload no se registra nada.
+- Códigos de cierre intactos: 4401 (token), 4403 (sin acceso),
+  4404 (diagrama).
 """
 
-import asyncio
 import logging
 from typing import Optional
 
+from beanie import PydanticObjectId
+from bson.errors import InvalidId
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from jose import JWTError
-from sqlalchemy import select
 
 from app.core.security import TOKEN_TYPE_ACCESS, decode_token
-from app.database import AsyncSessionLocal
 from app.models.usuario import Usuario
 from app.repositories.diagrama_repository import DiagramaRepository
 from app.repositories.proyecto_repository import MiembroProyectoRepository
@@ -53,7 +78,7 @@ router = APIRouter()
 @router.websocket("/ws/diagramas/{diagrama_id}")
 async def collaboration_endpoint(
     websocket: WebSocket,
-    diagrama_id: int,
+    diagrama_id: str,
     token: Optional[str] = Query(
         None, description="JWT de acceso del usuario (query param)"
     ),
@@ -76,30 +101,40 @@ async def collaboration_endpoint(
 
     # ------------------------------------------------------------------
     # 2) Verificar pertenencia al proyecto del diagrama
+    #    (Ciclo 1: bloque async with AsyncSessionLocal con select(). Ciclo
+    #    2: repositorios sin estado; el id malformado cierra 4404.)
     # ------------------------------------------------------------------
-    async with AsyncSessionLocal() as db:
-        diagrama = await DiagramaRepository(db).get_by_id(diagrama_id)
-        if diagrama is None:
-            await websocket.close(code=4404, reason="Diagrama no encontrado")
-            return
+    try:
+        diagrama_oid = PydanticObjectId(diagrama_id)
+    except (TypeError, ValueError, InvalidId):
+        await websocket.close(code=4404, reason="Diagrama no encontrado")
+        return
 
-        miembro = await MiembroProyectoRepository(db).get_by_proyecto_usuario(
-            diagrama.id_proyecto, usuario.id
-        )
-        if miembro is None:
-            await websocket.close(code=4403, reason="Sin acceso al diagrama")
-            return
+    diagrama = await DiagramaRepository().get_by_id(diagrama_oid)
+    if diagrama is None:
+        await websocket.close(code=4404, reason="Diagrama no encontrado")
+        return
 
-        id_proyecto = diagrama.id_proyecto
+    miembro = await MiembroProyectoRepository().get_by_proyecto_usuario(
+        diagrama.id_proyecto, usuario.id
+    )
+    if miembro is None:
+        await websocket.close(code=4403, reason="Sin acceso al diagrama")
+        return
 
-    ##await websocket.accept()
+    id_proyecto = str(diagrama.id_proyecto)
+
     # ------------------------------------------------------------------
     # 3) Registrar conexión
+    #    (Ids como str: send_json no serializa ObjectId.)
     # ------------------------------------------------------------------
+    id_usuario_str = str(usuario.id)
+    nombre_usuario = usuario.nombre_completo
+
     id_conexion = await manager.connect(
         websocket,
-        id_usuario=usuario.id,
-        nombre_usuario=usuario.nombre_completo,
+        id_usuario=id_usuario_str,
+        nombre_usuario=nombre_usuario,
         id_diagrama=diagrama_id,
     )
 
@@ -108,8 +143,8 @@ async def collaboration_endpoint(
         diagrama_id,
         build_message(
             "join",
-            {"id_usuario": usuario.id, "nombre": usuario.nombre_completo},
-            sender={"id": usuario.id, "nombre": usuario.nombre_completo},
+            {"id_usuario": id_usuario_str, "nombre": nombre_usuario},
+            sender={"id": id_usuario_str, "nombre": nombre_usuario},
         ),
         excluir_conexion=id_conexion,
     )
@@ -149,7 +184,7 @@ async def collaboration_endpoint(
             )
 
     except WebSocketDisconnect:
-        logger.info("WS desconectado por el cliente: usuario=%s", usuario.id)
+        logger.info("WS desconectado por el cliente: usuario=%s", id_usuario_str)
     except Exception as exc:
         logger.exception("Error inesperado en WS: %s", exc)
     finally:
@@ -161,8 +196,8 @@ async def collaboration_endpoint(
             diagrama_id,
             build_message(
                 "leave",
-                {"id_usuario": usuario.id, "nombre": usuario.nombre_completo},
-                sender={"id": usuario.id, "nombre": usuario.nombre_completo},
+                {"id_usuario": id_usuario_str, "nombre": nombre_usuario},
+                sender={"id": id_usuario_str, "nombre": nombre_usuario},
             ),
         )
 
@@ -171,6 +206,12 @@ async def collaboration_endpoint(
 # Autenticación
 # ======================================================================
 async def _autenticar_usuario(token: str) -> Optional[Usuario]:
+    """
+    Ciclo 1: sub = int(id) + select(Usuario). Ciclo 2: el sub del JWT es
+    el ObjectId en hex; un sub malformado es un token inválido (mismo
+    patrón que core/dependencies.py) y el usuario se resuelve con
+    Usuario.get() de Beanie.
+    """
     try:
         payload = decode_token(token)
     except JWTError:
@@ -184,17 +225,15 @@ async def _autenticar_usuario(token: str) -> Optional[Usuario]:
         return None
 
     try:
-        usuario_id = int(sub)
-    except (TypeError, ValueError):
+        usuario_id = PydanticObjectId(sub)
+    except (TypeError, ValueError, InvalidId):
         return None
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Usuario).where(Usuario.id == usuario_id))
-        user = result.scalar_one_or_none()
+    usuario = await Usuario.get(usuario_id)
 
-    if user is None or not user.activo:
+    if usuario is None or not usuario.activo:
         return None
-    return user
+    return usuario
 
 
 # ======================================================================
@@ -204,13 +243,16 @@ async def _procesar_mensaje(
     *,
     mensaje,
     id_conexion: int,
-    id_diagrama: int,
-    id_proyecto: int,
+    id_diagrama: str,
+    id_proyecto: str,
     usuario: Usuario,
 ) -> None:
     tipo = mensaje.type
     payload = mensaje.payload or {}
-    sender = {"id": usuario.id, "nombre": usuario.nombre_completo}
+    sender = {
+        "id": str(usuario.id),
+        "nombre": usuario.nombre_completo,
+    }
 
     # ------------------------------------------------------------------
     # Ping / pong (keepalive)
@@ -256,10 +298,11 @@ async def _procesar_mensaje(
             excluir_conexion=id_conexion,
         )
 
-        # 2) Registrar en historial (transacción corta y separada)
+        # 2) Registrar en historial (insert autónomo, independiente del
+        #    request REST que persistió el cambio)
         await _registrar_cambio_en_historial(
             id_diagrama=id_diagrama,
-            usuario_id=usuario.id,
+            usuario_id=str(usuario.id),
             evento=tipo,
             payload=payload,
         )
@@ -282,15 +325,19 @@ async def _procesar_mensaje(
 # ======================================================================
 async def _registrar_cambio_en_historial(
     *,
-    id_diagrama: int,
-    usuario_id: int,
+    id_diagrama: str,
+    usuario_id: str,
     evento: str,
     payload: dict,
 ) -> None:
     """
     Inserta un registro en `historial_cambios_diagrama` para el cambio
-    recibido por WS. Se hace en su propia transacción (independiente del
-    request REST) para que el historial quede aunque el cliente caiga.
+    recibido por WS. Se hace en su propia transacción lógica (insert
+    autónomo de Beanie, SIN commit — regla de la Tanda 19) para que el
+    historial quede aunque el cliente caiga.
+
+    Ciclo 2: id_diagrama/id_usuario van como PydanticObjectId y
+    id_entidad es el uuid str del elemento EMBEBIDO del Diagrama.
     """
     tipo_cambio = EVENTO_A_CAMBIO.get(evento)
     tipo_entidad = EVENTO_A_ENTIDAD.get(evento)
@@ -300,7 +347,7 @@ async def _registrar_cambio_en_historial(
     # id_entidad: lo sacamos del payload según convención
     id_entidad = _extraer_id_entidad(evento, payload)
     if id_entidad is None:
-        # Sin id_entidad no podemos registrar (la columna es NOT NULL)
+        # Sin id_entidad no podemos registrar (el campo es obligatorio)
         return
 
     # Import local para evitar cargar estos módulos si el WS no se usa
@@ -308,29 +355,27 @@ async def _registrar_cambio_en_historial(
     from app.repositories.trazabilidad_repository import HistorialCambioRepository
 
     try:
-        async with AsyncSessionLocal() as db:
-            repo = HistorialCambioRepository(db)
-            await repo.create(
-                HistorialCambioDiagrama(
-                    id_diagrama=id_diagrama,
-                    id_usuario=usuario_id,
-                    tipo_cambio=tipo_cambio,
-                    tipo_entidad=tipo_entidad,
-                    id_entidad=id_entidad,
-                    datos_cambio=payload,
-                )
+        await HistorialCambioRepository().create(
+            HistorialCambioDiagrama(
+                id_diagrama=PydanticObjectId(id_diagrama),
+                id_usuario=PydanticObjectId(usuario_id),
+                tipo_cambio=tipo_cambio,
+                tipo_entidad=tipo_entidad,
+                id_entidad=id_entidad,
+                datos_cambio=payload,
             )
-            await db.commit()
+        )
     except Exception as exc:
         # No romper el WS si falla el registro de historial
         logger.warning("No se pudo registrar cambio en historial: %s", exc)
 
 
-def _extraer_id_entidad(evento: str, payload: dict) -> Optional[int]:
+def _extraer_id_entidad(evento: str, payload: dict) -> Optional[str]:
     """
     Saca el id de la entidad afectada del payload según el tipo de evento.
     Convención: cada payload trae el id del elemento como `id` o `id_clase`
-    o `id_atributo`, etc.
+    o `id_atributo`, etc. En el Ciclo 2 son uuid str (ids de elementos
+    EMBEBIDOS del Diagrama): ya no se convierte a int.
     """
     claves = [
         "id",
@@ -341,9 +386,8 @@ def _extraer_id_entidad(evento: str, payload: dict) -> Optional[int]:
         "id_interfaz",
     ]
     for k in claves:
-        if k in payload:
-            try:
-                return int(payload[k])
-            except (TypeError, ValueError):
-                continue
+        if k in payload and payload[k] is not None:
+            valor = str(payload[k]).strip()
+            if valor:
+                return valor
     return None

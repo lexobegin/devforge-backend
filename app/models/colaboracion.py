@@ -1,150 +1,55 @@
 # app/models/colaboracion.py
 """
-Modelos ORM del módulo B. Proyectos y Colaboración (parte 2):
+Documentos del módulo B. Proyectos y Colaboración (parte 2) — CICLO 2.
 
-- SesionColaboracion     → sesión activa de edición colaborativa en tiempo real
-                           sobre un diagrama.
-- ParticipanteSesion     → usuario conectado dentro de una sesión, con su
-                           posición/foco actual en el lienzo (para verlo en vivo).
+- SesionColaboracion → sesión activa de edición colaborativa en tiempo real
+                       sobre un diagrama (colección "sesiones_colaboracion").
+- ParticipanteSesion → usuario conectado dentro de una sesión, con su
+                       posición/foco actual en el lienzo para verlo en vivo
+                       (documento EMBEBIDO en SesionColaboracion.participantes).
 
-Nota: la FK `sesiones_colaboracion.id_diagrama → diagramas.id` se declara aquí
-con `use_alter=True` porque `diagramas` se define en otro archivo (diagrama.py).
-SQLAlchemy la emitirá en el orden correcto (después de crear `diagramas`).
+Cambios respecto al Ciclo 1 (tablas PostgreSQL → documentos MongoDB):
+- La tabla participantes_sesion desaparece como colección: cada participante
+  va EMBEBIDO dentro de su sesión. El evento PRESENCIA del WebSocket
+  actualiza el cursor sobre este mismo documento y una lectura de la sesión
+  devuelve el estado completo de presencia sin joins.
+- posicion_cursor conserva su formato libre (antes JSONB): el WebSocket del
+  Ciclo 2 guarda x, y, zoom y el elemento enfocado sin migraciones.
+- Las FK desaparecen: id_proyecto e id_diagrama son ObjectIds con índice
+  (la nota de use_alter del Ciclo 1 ya no aplica: no hay orden de creación
+  de tablas que romper).
+- Las relationships (proyecto, diagrama, participantes) desaparecen: el
+  diagrama se resuelve con Diagrama.get(self.id_diagrama).
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import DateTime, ForeignKey, func
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.database import Base
+from beanie import Document, PydanticObjectId
+from pydantic import BaseModel, Field
 
 
 # ======================================================================
-# SesionColaboracion
+# ParticipanteSesion (embebido)
 # ======================================================================
-class SesionColaboracion(Base):
-    __tablename__ = "sesiones_colaboracion"
+class ParticipanteSesion(BaseModel):  # embebido: los embebidos de Beanie son pydantic
+    """Participante de una sesión colaborativa (antes tabla
+    participantes_sesion)."""
 
     # ------------------------------------------------------------------
-    # Columnas
+    # Campos (antes columnas de la tabla participantes_sesion)
     # ------------------------------------------------------------------
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    id_usuario: PydanticObjectId
 
-    id_proyecto: Mapped[int] = mapped_column(
-        ForeignKey("proyectos.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
+    joined_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
     )
 
-    # FK hacia "diagramas" — declarada con use_alter para romper la dependencia
-    # circular de orden de creación entre sesiones_colaboracion y diagramas.
-    id_diagrama: Mapped[int] = mapped_column(
-        ForeignKey(
-            "diagramas.id",
-            ondelete="CASCADE",
-            use_alter=True,
-            name="fk_sesion_diagrama",
-        ),
-        nullable=False,
-        index=True,
-    )
+    left_at: Optional[datetime] = None
 
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
-    )
-
-    ended_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=False), nullable=True
-    )
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    proyecto: Mapped["Proyecto"] = relationship(  # noqa: F821
-        "Proyecto",
-        foreign_keys=[id_proyecto],
-    )
-
-    # La relación hacia Diagrama se define aquí solo por FK (sin back_populates)
-    # para no forzar el import cruzado. diagrama.py puede añadir la inversa.
-    diagrama: Mapped["Diagrama"] = relationship(  # noqa: F821
-        "Diagrama",
-        foreign_keys=[id_diagrama],
-        lazy="selectin",
-    )
-
-    participantes: Mapped[list["ParticipanteSesion"]] = relationship(
-        "ParticipanteSesion",
-        back_populates="sesion",
-        cascade="all, delete-orphan",
-    )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    @property
-    def activa(self) -> bool:
-        """Una sesión sigue activa mientras no tenga fecha de fin."""
-        return self.ended_at is None
-
-    def __repr__(self) -> str:
-        return (
-            f"<SesionColaboracion id={self.id} proyecto={self.id_proyecto} "
-            f"diagrama={self.id_diagrama} activa={self.activa}>"
-        )
-
-
-# ======================================================================
-# ParticipanteSesion
-# ======================================================================
-class ParticipanteSesion(Base):
-    __tablename__ = "participantes_sesion"
-
-    # ------------------------------------------------------------------
-    # Columnas
-    # ------------------------------------------------------------------
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_sesion: Mapped[int] = mapped_column(
-        ForeignKey("sesiones_colaboracion.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    id_usuario: Mapped[int] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-
-    joined_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
-    )
-
-    left_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=False), nullable=True
-    )
-
-    # Posición/foco actual del usuario en el lienzo (x, y, zoom, elemento activo…)
-    # Se usa JSONB para poder evolucionar el formato sin migraciones.
-    posicion_cursor: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        JSONB, nullable=True
-    )
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    sesion: Mapped["SesionColaboracion"] = relationship(
-        "SesionColaboracion", back_populates="participantes"
-    )
-
-    usuario: Mapped["Usuario"] = relationship(  # noqa: F821
-        "Usuario",
-        foreign_keys=[id_usuario],
-    )
+    # Posición/foco actual del usuario en el lienzo (x, y, zoom, elemento
+    # activo…). Formato libre — antes columna JSONB.
+    posicion_cursor: Optional[dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -156,6 +61,66 @@ class ParticipanteSesion(Base):
 
     def __repr__(self) -> str:
         return (
-            f"<ParticipanteSesion id={self.id} sesion={self.id_sesion} "
-            f"usuario={self.id_usuario} conectado={self.conectado}>"
+            f"<ParticipanteSesion usuario={self.id_usuario} "
+            f"conectado={self.conectado}>"
+        )
+
+
+# ======================================================================
+# SesionColaboracion
+# ======================================================================
+class SesionColaboracion(Document):
+    """Sesión de edición colaborativa (colección "sesiones_colaboracion")."""
+
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla sesiones_colaboracion)
+    # ------------------------------------------------------------------
+    id_proyecto: PydanticObjectId
+
+    id_diagrama: PydanticObjectId
+
+    started_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    ended_at: Optional[datetime] = None
+
+    # Participantes EMBEBIDOS (antes tabla participantes_sesion)
+    participantes: list[ParticipanteSesion] = Field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Configuración del documento
+    # ------------------------------------------------------------------
+    class Settings:
+        name = "sesiones_colaboracion"  # mismo nombre que la tabla del Ciclo 1
+        indexes = ["id_proyecto", "id_diagrama"]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @property
+    def activa(self) -> bool:
+        """Una sesión sigue activa mientras no tenga fecha de fin."""
+        return self.ended_at is None
+
+    def participante(
+        self, id_usuario: PydanticObjectId
+    ) -> Optional[ParticipanteSesion]:
+        """Devuelve la participación del usuario en la sesión (o None),
+        esté conectado o ya haya salido."""
+        for participante in self.participantes:
+            if participante.id_usuario == id_usuario:
+                return participante
+        return None
+
+    @property
+    def conectados(self) -> list[ParticipanteSesion]:
+        """Participantes conectados ahora mismo (para el broadcast de
+        PRESENCIA del WebSocket)."""
+        return [p for p in self.participantes if p.conectado]
+
+    def __repr__(self) -> str:
+        return (
+            f"<SesionColaboracion id={self.id} proyecto={self.id_proyecto} "
+            f"diagrama={self.id_diagrama} activa={self.activa}>"
         )

@@ -1,68 +1,53 @@
 # app/models/usuario.py
 """
-Modelo ORM: usuarios (módulo A. Usuarios y Seguridad).
+Documento: usuarios (módulo A. Usuarios y Seguridad) — CICLO 2.
 
 Representa a Ingenieros de Software, Líderes de Proyecto y Administradores
 de la plataforma DevForge AI.
+
+Cambios respecto al Ciclo 1 (tabla PostgreSQL → documento MongoDB):
+- SQLAlchemy Base → beanie.Document; el nombre de la COLECCIÓN se conserva
+  ("usuarios") para que la migración de datos sea directa.
+- email sigue siendo único e indexado (Indexed(str, unique=True)); el índice
+  lo crea init_beanie al arrancar (reemplaza al índice de la tabla SQL).
+- Las relationships de SQLAlchemy desaparecen: en MongoDB no hay joins.
+  - proyectos_propios: se consultan con Proyecto.find(Proyecto.id_propietario == self.id)
+  - membresias: ahora viven EMBEBIDAS en cada proyecto (Proyecto.miembros),
+    con el rol dentro de cada proyecto (MiembroProyecto).
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Literal
 
-from sqlalchemy import Boolean, DateTime, String, func
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from beanie import Document, Indexed
+from pydantic import Field
 
-from app.database import Base
+RolGlobal = Literal["ADMIN", "LIDER", "DESARROLLADOR"]
 
 
-class Usuario(Base):
-    __tablename__ = "usuarios"
-
-    # ------------------------------------------------------------------
-    # Columnas
-    # ------------------------------------------------------------------
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    nombre_completo: Mapped[str] = mapped_column(String(150), nullable=False)
-
-    email: Mapped[str] = mapped_column(
-        String(150), nullable=False, unique=True, index=True
-    )
-
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-
-    rol: Mapped[str] = mapped_column(
-        String(20),
-        nullable=False,
-        default="DESARROLLADOR",
-        server_default="DESARROLLADOR",
-    )
-
-    activo: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default="true"
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False),
-        nullable=False,
-        server_default=func.now(),
-    )
+class Usuario(Document):
+    """Usuario de la plataforma (coleccion 'usuarios')."""
 
     # ------------------------------------------------------------------
-    # Relaciones (se irán completando cuando existan los modelos destino)
+    # Campos (antes columnas de la tabla usuarios)
     # ------------------------------------------------------------------
-    # Proyectos donde el usuario es propietario
-    proyectos_propios: Mapped[list["Proyecto"]] = relationship(  # noqa: F821
-        "Proyecto",
-        back_populates="propietario",
-        foreign_keys="Proyecto.id_propietario",
-    )
+    nombre_completo: str
 
-    # Membresías a proyectos (con rol dentro de cada uno)
-    membresias: Mapped[list["MiembroProyecto"]] = relationship(  # noqa: F821
-        "MiembroProyecto",
-        back_populates="usuario",
-        cascade="all, delete-orphan",
-    )
+    email: Indexed(str, unique=True)
+
+    password_hash: str
+
+    rol: RolGlobal = "DESARROLLADOR"
+
+    activo: bool = True
+
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # ------------------------------------------------------------------
+    # Configuración del documento
+    # ------------------------------------------------------------------
+    class Settings:
+        name = "usuarios"          # mismo nombre que la tabla del Ciclo 1
 
     # ------------------------------------------------------------------
     # Helpers

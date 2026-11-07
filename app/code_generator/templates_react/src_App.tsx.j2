@@ -1,0 +1,18 @@
+// Generado por DevForge AI (CU24) — {{ nombre_app }}
+{% for e in entidades %}
+import {{ e.nombre }}Lista from "./components/{{ e.nombre }}Lista";
+{% endfor %}
+
+export default function App() {
+  return (
+    <main className="app">
+      <h1>{{ nombre_app }}</h1>
+      <p>CRUD generado a partir del diagrama UML ({{ total_entidades }} entidades).</p>
+{% for e in entidades %}
+      <section id="{{ e.recurso }}">
+        <{{ e.nombre }}Lista />
+      </section>
+{% endfor %}
+    </main>
+  );
+}

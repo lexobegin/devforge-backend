@@ -1,6 +1,7 @@
 # app/api/v1/ai_vision_router.py
 """
-Endpoints del módulo de IA de VISIÓN (boceto/imagen → diagrama de clases).
+Endpoints del módulo de IA de VISIÓN (boceto/imagen → diagrama de clases)
+— CICLO 2.
 
 - POST /api/v1/ai-vision/diagramas/{diagrama_id}/reconocer    → subir imagen y reconocer
 - POST /api/v1/ai-vision/reconocer                            → reconocer sin persistir
@@ -10,19 +11,23 @@ reconocimiento de voz). El cliente sube una foto/imagen del boceto y
 recibe un diagrama reconstruido listo para insertar.
 
 El módulo `app/ai_vision/` (vision_service, sketch_recognition,
-uml_reconstructor) hace el trabajo pesado. Aquí solo se recibe la imagen
-y se delega.
+uml_reconstructor — Tanda 19) hace el trabajo pesado. Aquí solo se
+recibe la imagen y se delega.
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession — la verificación de
+pertenencia usa los repositorios SIN ESTADO (DiagramaRepository +
+MiembroProyectoRepository); ids de ruta PydanticObjectId; NotFoundError
+en lugar de HTTPException.
 """
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 
 from app.config import settings
 from app.core.dependencies import get_current_active_user
-from app.core.exceptions import BadRequestError
-from app.database import get_db
+from app.core.exceptions import BadRequestError, NotFoundError
 from app.models.usuario import Usuario
 from app.schemas.ia_schema import VisionReconocimientoResponse
 
@@ -43,29 +48,25 @@ router = APIRouter()
     ),
 )
 async def reconocer_y_persistir(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     imagen: UploadFile = File(..., description="Imagen del boceto (jpg/png)"),
     idioma: str = Form("es", description="Idioma esperado del texto en el boceto"),
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> VisionReconocimientoResponse:
     contenido = await _validar_imagen(imagen)
 
-    # Verificar pertenencia al proyecto del diagrama
+    # Verificar pertenencia al proyecto del diagrama (repositorios sin estado)
     from app.repositories.diagrama_repository import DiagramaRepository
     from app.repositories.proyecto_repository import MiembroProyectoRepository
 
-    diagrama = await DiagramaRepository(db).get_by_id(diagrama_id)
+    diagrama = await DiagramaRepository().get_by_id(diagrama_id)
     if diagrama is None:
-        from app.core.exceptions import NotFoundError
-
         raise NotFoundError("Diagrama no encontrado")
-    miembro = await MiembroProyectoRepository(db).get_by_proyecto_usuario(
+    miembro = await MiembroProyectoRepository().get_by_proyecto_usuario(
         diagrama.id_proyecto, current_user.id
     )
     if miembro is None:
-        from app.core.exceptions import NotFoundError
-
+        # 404 genérico para no revelar proyectos ajenos
         raise NotFoundError("Recurso no encontrado")
 
     # Delegar al módulo ai_vision

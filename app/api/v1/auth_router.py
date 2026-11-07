@@ -1,19 +1,23 @@
 # app/api/v1/auth_router.py
 """
-Endpoints de autenticación (módulo A. Usuarios y Seguridad):
+Endpoints de autenticación (módulo A. Usuarios y Seguridad) — CICLO 2.
 
 - POST /api/v1/auth/registro        → crear cuenta
 - POST /api/v1/auth/login           → iniciar sesión (devuelve tokens)
 - POST /api/v1/auth/refresh         → renovar access token con refresh token
 - POST /api/v1/auth/cambiar-password → cambiar contraseña del usuario actual
 - GET  /api/v1/auth/me              → perfil del usuario autenticado
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession (los services se
+instancian sin sesión) y SIN commit=True en la bitácora (MongoDB no tiene
+transacciones aquí: cada insert() es autónomo, igual que el commit
+independiente del Ciclo 1). Los ids del payload sub son el ObjectId del
+usuario en hex (str), no el int del serial.
 """
 
 from fastapi import APIRouter, Depends, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_current_active_user
-from app.database import get_db
 from app.models.usuario import Usuario
 from app.schemas.usuario_schema import (
     PasswordChange,
@@ -41,14 +45,13 @@ router = APIRouter()
 )
 async def registro(
     datos: UsuarioCreate,
-    db: AsyncSession = Depends(get_db),
 ) -> UsuarioResponse:
-    service = AuthService(db)
+    service = AuthService()
     usuario = await service.registrar(datos)
 
-    # Bitácora del evento (commit independiente)
-    auditoria = AuditoriaService(db)
-    await auditoria.log_registro(usuario.id, commit=True)
+    # Bitácora del evento (insert autónomo, como el commit=True del Ciclo 1)
+    auditoria = AuditoriaService()
+    await auditoria.log_registro(usuario.id)
 
     return usuario
 
@@ -67,14 +70,13 @@ async def registro(
 )
 async def login(
     datos: UsuarioLogin,
-    db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
-    service = AuthService(db)
+    service = AuthService()
     tokens = await service.login(datos)
 
     # Bitácora del login
-    auditoria = AuditoriaService(db)
-    await auditoria.log_login(tokens.usuario.id, commit=True)
+    auditoria = AuditoriaService()
+    await auditoria.log_login(tokens.usuario.id)
 
     return tokens
 
@@ -90,9 +92,8 @@ async def login(
 )
 async def refresh(
     datos: RefreshTokenRequest,
-    db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
-    service = AuthService(db)
+    service = AuthService()
     return await service.refrescar_token(datos.refresh_token)
 
 
@@ -108,9 +109,8 @@ async def refresh(
 async def cambiar_password(
     datos: PasswordChange,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = AuthService(db)
+    service = AuthService()
     await service.cambiar_password(current_user, datos)
 
 

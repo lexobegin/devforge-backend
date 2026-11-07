@@ -1,330 +1,418 @@
 # app/code_generator/generator_service.py
 """
-Servicio orquestador de la generación automática de backend Spring Boot.
+Servicio orquestador de la generación automática de backend Spring Boot
+(módulo F, CU6) — CICLO 2.
 
-Responsabilidades:
-- Recibir un trabajo de generación (PENDIENTE) y ejecutarlo.
-- Cargar el diagrama completo, mapearlo con MappingEngine, renderizar las
-  plantillas Jinja2 y escribir el proyecto en `generated_projects/{id}/`.
-- Actualizar el estado del trabajo (`EN_PROCESO` → `EXITOSO`/`FALLIDO`).
-- Crear los registros `entidades_generadas` y `reglas_mapeo` del trabajo.
-- Registrar en bitácora y notificar al usuario.
+RECONVERTIDO del Ciclo 1 (SQLAlchemy/AsyncSession) a Beanie/MongoDB con
+los textos del Ciclo 1 como base. Se conserva el PIPELINE y el CONTRATO
+DE PLANTILLAS (mismos contextos, mismos .jinja en templates/); lo que
+cambia es la capa de datos y el control de calidad:
 
-El proyecto generado es autocontenido: no acumula estado entre ejecuciones.
+1. PERMISOS: diagrama existente + membresía del proyecto. En el Ciclo 1
+   exigía EDITOR para crear el trabajo; en el Ciclo 2 se alinea con CU24
+   (Tanda 17): generar NO muta el diagrama, así que basta LECTURA
+   (criterio defensivo idéntico: ajeno → 404 genérico "Recurso no
+   encontrado", inexistente → "Diagrama no encontrado").
+2. GATE FORMAL (NUEVO Ciclo 2): validar_diagrama_para_generar()
+   (app/utils/validators) recorre el diagrama y COLECTA ProblemaModelo.
+   Si hay ERRORes se rechaza la generación con el informe completo
+   ANTES de crear el trabajo (0 documentos huérfanos). En el Ciclo 1 no
+   había gate: el pipeline fallaba a mitad con GenerationError (excepción
+   que el Ciclo 2 ya no tiene; los fallos de modelado ahora son
+   ValidationError del llamante y los de I/O relanzan la excepción
+   original para que el router T19 la mapee a 500).
+3. TRABAJO: TrabajoGeneracionCodigo (stack SPRING_BOOT_JPA_POSTGRES,
+   default del modelo) con PENDIENTE → EN_PROCESO → EXITOSO/FALLIDO a
+   través de TrabajoGeneracionRepository (marcar_* SIEMPRE re-leen el
+   documento: hallazgo T12).
+4. RESULTADO EMBEBIDO: en el Ciclo 1 se creaban filas en
+   entidades_generadas y reglas_mapeo (bulk_create con flush para ids);
+   en el Ciclo 2 ambas viven EMBEBIDAS en trabajo.entidades[] →
+   reglas_mapeo[] (Tanda 4): una EntidadGenerada por clase UML, cada una
+   con UNA ReglaMapeo por atributo real (la PK sintética no tiene
+   atributo UML y no genera regla). El documento se guarda con
+   update() ANTES de marcar_exitoso (que re-lee y devuelve el trabajo
+   completo).
+5. ARCHIVOS: cada generación escribe su propia subcarpeta de
+   GENERATED_PROJECTS_DIR (fecha + id del diagrama: NUNCA sobrescribe —
+   el Ciclo 1 hacía shutil.rmtree del destino) y el ZIP junto a ella;
+   ruta_salida = nombre del ZIP (relativo).
+6. BITÁCORA + NOTIFICACIÓN (igual que el Ciclo 1, con las firmas del
+   Ciclo 2): AuditoriaService.log_generacion_completada/fallida y
+   NotificacionService.crear_para_miembros_de_proyecto(tipo
+   GENERACION_COMPLETA, excluyendo al que disparó). Ambos van en
+   try/except: un fallo de bitácora NO tumba una generación exitosa.
+
+Estructura del proyecto generado (igual que el Ciclo 1):
+    backend/
+      pom.xml
+      src/main/java/<paquete>/BackendApplication.java
+      src/main/java/<paquete>/entity/<Entidad>.java
+      src/main/java/<paquete>/repository/<Entidad>Repository.java
+      src/main/java/<paquete>/service/<Entidad>Service.java
+      src/main/java/<paquete>/controller/<Entidad>Controller.java
+      src/main/java/<paquete>/dto/<Entidad>DTO.java
+      src/main/resources/application.properties
+      postman/<artifact>.postman_collection.json
+    README.md
 """
 
 import logging
-import shutil
+import re
+import unicodedata
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from beanie import PydanticObjectId
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.code_generator.mapping_engine import MappingEngine, MappingResult
+from app.code_generator.postman_export import generar_coleccion_postman
 from app.config import settings
-from app.core.exceptions import GenerationError, NotFoundError
-from app.models.generacion import EntidadGenerada, ReglaMapeo, TrabajoGeneracionCodigo
+from app.core.exceptions import NotFoundError, ValidationError
+from app.models.diagrama import Diagrama
+from app.models.generacion import (
+    EntidadGenerada,
+    ReglaMapeo,
+    TrabajoGeneracionCodigo,
+)
 from app.repositories.diagrama_repository import DiagramaRepository
-from app.repositories.generacion_repository import (
-    EntidadGeneradaRepository,
-    ReglaMapeoRepository,
-    TrabajoGeneracionRepository,
-)
-from app.repositories.proyecto_repository import (
-    MiembroProyectoRepository,
-    ProyectoRepository,
-)
-from app.schemas.generacion_schema import (
-    DescargaProyectoResponse,
-    GenerarBackendRequest,
-    TrabajoGeneracionDetalleResponse,
-    TrabajoGeneracionCodigoResponse,
-#    TrabajoGeneracionResponse,
+from app.repositories.generacion_repository import TrabajoGeneracionRepository
+from app.repositories.proyecto_repository import MiembroProyectoRepository
+from app.utils.validators import (
+    formatear_problemas,
+    hay_errores,
+    validar_diagrama_para_generar,
 )
 
 logger = logging.getLogger("devforge.generator")
 
+# Stack del backend (default del modelo; el schema Literal del Ciclo 1 ya
+# lo trae — el router T19 solo valida la entrada del cliente).
+STACK_BACKEND = "SPRING_BOOT_JPA_POSTGRES"
+
+# Rutas de plantillas (mismas 8 .jinja del Ciclo 1: la VM del usuario las
+# conserva intactas; aquí van equivalentes funcionales para el arnés).
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+
 
 # ======================================================================
-# Rutas de plantillas
+# Sanitizadores de nombres (copia de los del generador de frontend T17)
 # ======================================================================
-TEMPLATES_DIR = Path(__file__).parent / "templates"
+# Copia LOCAL y justificada: el paquete code_generator no se acopla a
+# app.services (importar generador_frontend_service desde aquí crearía un
+# ciclo de imports: services/__init__ → generador_frontend →
+# code_generator.__init__ → generator_service → services…). Mismos
+# sanitizadores, mismo hallazgo T17 (salida ASCII pura).
+def _sin_acentos(texto: str) -> str:
+    return "".join(
+        c
+        for c in unicodedata.normalize("NFD", texto or "")
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def _palabras(nombre: str) -> list[str]:
+    return [
+        p
+        for p in re.split(r"[^0-9a-zA-Z]+", _sin_acentos(nombre))
+        if p
+    ]
+
+
+def _a_recurso(nombre: str) -> str:
+    """Nombre kebab-case para la carpeta/ZIP: 'Clínica V2' → 'clinica-v2'."""
+    return "-".join(p.lower() for p in _palabras(nombre)) or "backend"
 
 
 class GeneratorService:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-        self.diagramas = DiagramaRepository(db)
-        self.trabajos = TrabajoGeneracionRepository(db)
-        self.entidades = EntidadGeneradaRepository(db)
-        self.reglas = ReglaMapeoRepository(db)
-        self.proyectos = ProyectoRepository(db)
-        self.miembros = MiembroProyectoRepository(db)
+    """
+    CU6: diagrama UML → backend Spring Boot + JPA + PostgreSQL
+    (SPRING_BOOT_JPA_POSTGRES), registrado como TrabajoGeneracionCodigo
+    con el resultado EMBEBIDO (entidades + reglas de mapeo).
+    """
 
-        # Jinja2
+    def __init__(
+        self,
+        *,
+        package_base: Optional[str] = None,
+        artifact: Optional[str] = None,
+    ) -> None:
+        # Repositorios SIN ESTADO: la conexión la lleva Beanie (el Ciclo 1
+        # recibía AsyncSession y creaba 6 repositorios por sesión).
+        self.trabajos = TrabajoGeneracionRepository()
+        self.diagramas = DiagramaRepository()
+        self.miembros = MiembroProyectoRepository()
+
+        # Overrides del config (los pasa el router T19 desde
+        # GenerarBackendRequest; por defecto manda el config).
+        self.package_base = (
+            package_base or settings.GENERATED_BACKEND_GROUP_ID
+        ).strip()
+        self.artifact = (
+            artifact or settings.GENERATED_BACKEND_ARTIFACT_PREFIX
+        ).strip()
+
+        self.logger = logging.getLogger("devforge.generator")
+
+        # Jinja2 (mismo entorno que el Ciclo 1: los .jinja del usuario
+        # renderizan igual — autoescape solo para html/xml de la colección
+        # de nombre, trim/lstrip para salidas limpias).
         self.jinja = Environment(
             loader=FileSystemLoader(str(TEMPLATES_DIR)),
             autoescape=select_autoescape(enabled_extensions=("html", "xml")),
             trim_blocks=True,
             lstrip_blocks=True,
+            keep_trailing_newline=True,
         )
 
     # ==================================================================
     # API pública
     # ==================================================================
-    async def crear_trabajo(
+    async def generar_backend(
         self,
-        diagrama_id: int,
-        datos: GenerarBackendRequest,
+        id_usuario: PydanticObjectId,
+        id_diagrama: PydanticObjectId,
         *,
-        usuario_id: int,
-    ) -> TrabajoGeneracionCodigoResponse:
+        incluir_postman: bool = True,
+        nombre_proyecto: Optional[str] = None,
+    ) -> TrabajoGeneracionCodigo:
         """
-        Crea el registro del trabajo en estado PENDIENTE.
-        El procesamiento real lo dispara el router en background.
+        Ejecuta el pipeline completo: gate → mapeo → renderizado →
+        escritura → ZIP → resultado embebido → EXITOSO. Devuelve el
+        trabajo re-leído en estado EXITOSO (con entidades y reglas y la
+        ruta relativa del ZIP).
+
+        - Errores del llamante (inexistente, ajeno, sin clases, gate con
+          ERRORes) se propagan ANTES de crear el trabajo: 0 documentos
+          huérfanos.
+        - Un fallo de renderizado/escritura marca el trabajo FALLIDO
+          (finished_at, con bitácora GENERACION_FALLIDA) y RELANZA la
+          excepción original (el router T19 la mapea a HTTP).
         """
-        diagrama = await self.diagramas.get_by_id(diagrama_id)
-        if diagrama is None:
-            raise NotFoundError("Diagrama no encontrado")
+        # 1. Lectura del lienzo + membresía (errores del llamante: fuera).
+        diagrama = await self._diagrama_para_lectura(id_diagrama, id_usuario)
 
-        await self._require_editor(diagrama.id_proyecto, usuario_id)
+        # 2. Gate mínimo: sin clases no hay entidades que generar.
+        if not diagrama.clases:
+            raise ValidationError(
+                "El diagrama no tiene clases: no hay entidades para "
+                "generar el backend"
+            )
 
+        # 3. GATE FORMAL (Ciclo 2): colecta ProblemaModelo y rechaza con
+        #    el informe completo si hay ERRORes (antes de crear trabajo).
+        problemas = validar_diagrama_para_generar(diagrama)
+        if hay_errores(problemas):
+            raise ValidationError(formatear_problemas(problemas))
+        if problemas:
+            # Solo advertencias: se registran, la generación continúa.
+            logger.warning(
+                "Generación con advertencias de modelo: %s",
+                formatear_problemas(problemas).replace("\n", " | "),
+            )
+
+        # 4. Mapeo UML → Java/SQL (puro y determinista: un fallo aquí es
+        #    del modelo del llamante, también ANTES de crear el trabajo).
+        engine = MappingEngine(package_base=self.package_base)
+        mapeo = engine.mapear_diagrama(diagrama)
+        if not mapeo.entidades:
+            raise ValidationError(
+                "No se pudo mapear ninguna entidad del diagrama"
+            )
+
+        # 5. Trabajo PENDIENTE → EN_PROCESO (helpers re-leen el documento).
         trabajo = await self.trabajos.create(
             TrabajoGeneracionCodigo(
-                id_diagrama=diagrama_id,
-                id_usuario=usuario_id,
-                stack_destino=datos.stack_destino,
-                estado="PENDIENTE",
+                id_diagrama=diagrama.id,
+                id_usuario=id_usuario,
+                stack_destino=STACK_BACKEND,
             )
         )
-
-        await self.db.commit()
-        await self.db.refresh(trabajo)
-        return TrabajoGeneracionCodigoResponse.model_validate(trabajo)
-
-    async def procesar_trabajo(
-        self, trabajo_id: int, *, usuario_id: int
-    ) -> None:
-        """
-        Ejecuta el pipeline completo de generación. Se llama desde
-        BackgroundTasks con su propia AsyncSession.
-        """
-        trabajo = await self.trabajos.get_by_id(trabajo_id)
+        trabajo = await self.trabajos.marcar_en_proceso(trabajo.id)
         if trabajo is None:
-            logger.error("Trabajo %s no encontrado", trabajo_id)
-            return
-
-        await self.trabajos.marcar_en_proceso(trabajo_id)
-        await self.db.commit()
+            raise NotFoundError("Trabajo de generación no encontrado")
 
         try:
-            await self._generar(trabajo, usuario_id=usuario_id)
+            # 6. Renderizado a memoria (sync y sin I/O: costura del arnés
+            #    para probar la ruta FALLIDO).
+            archivos = self._renderizar(
+                diagrama=diagrama,
+                mapeo=mapeo,
+                trabajo_id=trabajo.id,
+                incluir_postman=incluir_postman,
+            )
+
+            # 7. Escritura en carpeta ÚNICA + ZIP (nunca sobrescribe).
+            carpeta = self._carpeta_destino(
+                nombre_proyecto or diagrama.nombre, diagrama.id
+            )
+            self._escribir(carpeta, archivos)
+            ruta_zip = self._empaquetar(carpeta)
+
+            # 8. Resultado EMBEBIDO sobre el documento en mano y save() del
+            #    padre (1 documento = 1 escritura coherente).
+            trabajo.entidades = self._resultado_embebido(diagrama, mapeo)
+            await self.trabajos.update(trabajo)
+
+            # 9. EXITOSO con la ruta RELATIVA del ZIP (el helper re-lee:
+            #    el documento devuelto trae las entidades ya guardadas).
+            final = await self.trabajos.marcar_exitoso(
+                trabajo.id, ruta_salida=ruta_zip.name
+            )
+            if final is None:
+                raise NotFoundError("Trabajo de generación no encontrado")
+
+            # 10. Bitácora + notificación (guardadas: no tumban el éxito).
+            await self._log_generacion_exitosa(final, diagrama, id_usuario)
+            await self._notificar_exito(final, diagrama, id_usuario)
+            return final
         except Exception as exc:
-            logger.exception("Error generando backend para trabajo %s", trabajo_id)
-            await self.trabajos.marcar_fallido(trabajo_id)
-            await self.db.commit()
-            # Bitácora de fallo
-            await self._log_generacion_fallida(trabajo, exc)
+            # Render/escritura falló: FALLIDO + bitácora del fallo y
+            # RELANZA el motivo real (T19 lo mapea a HTTP).
+            await self.trabajos.marcar_fallido(trabajo.id)
+            await self._log_generacion_fallida(
+                trabajo.id, diagrama, id_usuario, motivo=str(exc)
+            )
             raise
 
     # ==================================================================
-    # Pipeline
+    # Descarga
     # ==================================================================
-    async def _generar(self, trabajo: Any, *, usuario_id: int) -> None:
-        """Pipeline: cargar → mapear → renderizar → escribir → persistir."""
-        # 1) Cargar diagrama completo
-        diagrama = await self.diagramas.get_completo(trabajo.id_diagrama)
-        if diagrama is None:
-            raise GenerationError("El diagrama asociado no existe")
+    async def obtener_ruta_zip(
+        self,
+        trabajo_id: PydanticObjectId,
+        *,
+        usuario_id: PydanticObjectId,
+    ) -> Path:
+        """
+        Ruta absoluta del ZIP de un trabajo EXITOSO, lista para
+        FileResponse (el router T19 la sirve). Mismas defensas de
+        lectura que el resto del módulo: ajeno → 404 genérico.
+        """
+        trabajo = await self.trabajos.get_by_id(trabajo_id)
+        if trabajo is None:
+            raise NotFoundError("Trabajo de generación no encontrado")
 
-        if not diagrama.clases:
-            raise GenerationError(
-                "El diagrama no tiene clases para generar un backend"
+        diagrama = await self.diagramas.get_by_id(trabajo.id_diagrama)
+        if diagrama is None:
+            raise NotFoundError("Diagrama no encontrado")
+
+        miembro = await self.miembros.get_by_proyecto_usuario(
+            diagrama.id_proyecto, usuario_id
+        )
+        if miembro is None:
+            # 404 genérico para no revelar proyectos ajenos.
+            raise NotFoundError("Recurso no encontrado")
+
+        if not trabajo.fue_exitoso or not trabajo.ruta_salida:
+            raise ValidationError(
+                f"El trabajo no está listo para descarga "
+                f"(estado actual: {trabajo.estado})"
             )
 
-        # 2) Mapear con el engine
-        from app.code_generator.mapping_engine import MappingEngine
+        ruta = Path(settings.GENERATED_PROJECTS_DIR) / trabajo.ruta_salida
+        if not ruta.is_file():
+            raise NotFoundError("El archivo ZIP no está disponible")
+        return ruta
 
-        engine = MappingEngine(
-            package_base=settings.GENERATED_BACKEND_GROUP_ID
-        )
-        mapeo = engine.mapear_diagrama(diagrama)
-
-        if not mapeo.entidades:
-            raise GenerationError("No se pudo mapear ninguna entidad")
-
-        # 3) Preparar carpeta de salida
-        base_dir = Path(settings.GENERATED_PROJECTS_DIR).resolve()
-        base_dir.mkdir(parents=True, exist_ok=True)
-        proyecto_dir = base_dir / str(trabajo.id)
-        if proyecto_dir.exists():
-            shutil.rmtree(proyecto_dir)
-        proyecto_dir.mkdir(parents=True, exist_ok=True)
-
-        # 4) Renderizar archivos
-        await self._renderizar_proyecto(
-            proyecto_dir=proyecto_dir,
-            mapeo=mapeo,
-            diagrama=diagrama,
-            trabajo=trabajo,
-        )
-
-        # 5) Persistir entidades_generadas + reglas_mapeo
-        await self._persistir_mapeo(trabajo.id, diagrama, mapeo)
-
-        # 6) Comprimir como ZIP
-        zip_path = await self._empaquetar_zip(proyecto_dir)
-
-        # 7) Marcar trabajo exitoso
-        ruta_rel = str(proyecto_dir.relative_to(base_dir))
-        await self.trabajos.marcar_exitoso(trabajo.id, ruta_salida=ruta_rel)
-        await self.db.commit()
-
-        # 8) Bitácora + notificación
-        await self._log_generacion_exitosa(trabajo, usuario_id)
-        await self._notificar_exito(trabajo, usuario_id)
-
-    # ------------------------------------------------------------------
-    # Renderizado
-    # ------------------------------------------------------------------
-    async def _renderizar_proyecto(
+    # ==================================================================
+    # Renderizado (plantillas .jinja del Ciclo 1, mismos contextos)
+    # ==================================================================
+    def _renderizar(
         self,
         *,
-        proyecto_dir: Path,
-        mapeo: Any,
-        diagrama: Any,
-        trabajo: Any,
-    ) -> None:
+        diagrama: Diagrama,
+        mapeo: MappingResult,
+        trabajo_id: PydanticObjectId,
+        incluir_postman: bool = True,
+    ) -> dict[str, str]:
         """
-        Renderiza todas las plantillas Jinja2 y las escribe en el disco.
-        Estructura del proyecto generado:
-            backend/
-              pom.xml
-              src/main/java/<paquete>/
-                BackendApplication.java
-                entity/<Entidad>.java
-                repository/<Entidad>Repository.java
-                service/<Entidad>Service.java
-                controller/<Entidad>Controller.java
-                dto/<Entidad>DTO.java
-              src/main/resources/
-                application.properties
-              postman/
-                <nombre>.postman_collection.json
+        Plantillas → {ruta relativa del proyecto: contenido}. Esqueleto
+        una vez + un bloque de 5 archivos por entidad + colección Postman
+        + README. Sync y sin I/O: el arnés puede interceptarlo para
+        probar la ruta FALLIDO del trabajo (costura, igual que T17).
         """
-        package_path = Path(*settings.GENERATED_BACKEND_GROUP_ID.split("."))
-        java_src = (
-            proyecto_dir / "backend" / "src" / "main" / "java" / package_path
-        )
-        resources = proyecto_dir / "backend" / "src" / "main" / "resources"
-        postman_dir = proyecto_dir / "backend" / "postman"
-
-        for d in (
-            java_src / "entity",
-            java_src / "repository",
-            java_src / "service",
-            java_src / "controller",
-            java_src / "dto",
-            resources,
-            postman_dir,
-        ):
-            d.mkdir(parents=True, exist_ok=True)
-
         ctx_base = {
-            "package_base": settings.GENERATED_BACKEND_GROUP_ID,
-            "artifact": settings.GENERATED_BACKEND_ARTIFACT_PREFIX,
+            "package_base": self.package_base,
+            "artifact": self.artifact,
             "java_version": settings.GENERATED_BACKEND_JAVA_VERSION,
             "spring_boot_version": settings.GENERATED_BACKEND_SPRING_BOOT_VERSION,
             "postgres_version": settings.GENERATED_BACKEND_POSTGRES_VERSION,
-            "diagrama_nombre": getattr(diagrama, "nombre", ""),
-            "trabajo_id": trabajo.id,
+            "diagrama_nombre": diagrama.nombre,
+            "trabajo_id": str(trabajo_id),
         }
 
-        # pom.xml
-        self._render_a_archivo(
-            "pom.xml.jinja", proyecto_dir / "backend" / "pom.xml", ctx_base
+        # Ruta base del código Java dentro del proyecto generado.
+        paquete = "/".join(self.package_base.split("."))
+        java_base = f"backend/src/main/java/{paquete}"
+
+        archivos: dict[str, str] = {}
+
+        # pom.xml + application.properties + BackendApplication
+        archivos["backend/pom.xml"] = self._render("pom.xml.jinja", ctx_base)
+        archivos["backend/src/main/resources/application.properties"] = (
+            self._render("application.properties.jinja", ctx_base)
+        )
+        archivos[f"{java_base}/BackendApplication.java"] = self._render(
+            "main_application.java.jinja", ctx_base
         )
 
-        # application.properties
-        self._render_a_archivo(
-            "application.properties.jinja",
-            resources / "application.properties",
-            ctx_base,
-        )
-
-        # BackendApplication.java
-        self._render_a_archivo(
-            "main_application.java.jinja",
-            java_src / "BackendApplication.java",
-            ctx_base,
-        )
-
-        # Por cada entidad
+        # Por cada entidad: los 5 archivos del Ciclo 1.
         for entidad in mapeo.entidades:
             ctx = {**ctx_base, "entidad": entidad}
-
-            self._render_a_archivo(
-                "entity.java.jinja",
-                java_src / "entity" / f"{entidad.nombre_clase_java}.java",
-                ctx,
+            nombre = entidad.nombre_clase_java
+            archivos[f"{java_base}/entity/{nombre}.java"] = self._render(
+                "entity.java.jinja", ctx
             )
-            self._render_a_archivo(
-                "repository.java.jinja",
-                java_src / "repository" / f"{entidad.nombre_clase_java}Repository.java",
-                ctx,
+            archivos[f"{java_base}/repository/{nombre}Repository.java"] = (
+                self._render("repository.java.jinja", ctx)
             )
-            self._render_a_archivo(
-                "service.java.jinja",
-                java_src / "service" / f"{entidad.nombre_clase_java}Service.java",
-                ctx,
+            archivos[f"{java_base}/service/{nombre}Service.java"] = (
+                self._render("service.java.jinja", ctx)
             )
-            self._render_a_archivo(
-                "controller.java.jinja",
-                java_src / "controller" / f"{entidad.nombre_clase_java}Controller.java",
-                ctx,
+            archivos[f"{java_base}/controller/{nombre}Controller.java"] = (
+                self._render("controller.java.jinja", ctx)
             )
-            self._render_a_archivo(
-                "dto.java.jinja",
-                java_src / "dto" / f"{entidad.nombre_clase_java}DTO.java",
-                ctx,
+            archivos[f"{java_base}/dto/{nombre}DTO.java"] = self._render(
+                "dto.java.jinja", ctx
             )
 
-        # Colección Postman
-        from app.code_generator.postman_export import generar_coleccion_postman
+        # Colección Postman (si el trabajo la pidió).
+        if incluir_postman:
+            coleccion = generar_coleccion_postman(
+                mapeo=mapeo, nombre_proyecto=self.artifact
+            )
+            archivos[
+                f"backend/postman/{self.artifact}.postman_collection.json"
+            ] = coleccion
 
-        coleccion = generar_coleccion_postman(
-            mapeo=mapeo, nombre_proyecto=ctx_base["artifact"]
-        )
-        (postman_dir / f"{ctx_base['artifact']}.postman_collection.json").write_text(
-            coleccion, encoding="utf-8"
-        )
+        # README con instrucciones rápidas (lo escribe el service, igual
+        # que el Ciclo 1 con _escribir_readme).
+        archivos["README.md"] = self._leeme(ctx_base, mapeo)
+        return archivos
 
-        # README con instrucciones rápidas
-        self._escribir_readme(proyecto_dir, ctx_base, mapeo)
-
-    def _render_a_archivo(
-        self, template_name: str, destino: Path, ctx: dict[str, Any]
-    ) -> None:
+    def _render(self, nombre_plantilla: str, contexto: dict[str, Any]) -> str:
+        """Renderiza UNA plantilla con errores explicativos (el Ciclo 1
+        envolvía en GenerationError; el Ciclo 2 relanza RuntimeError con
+        el motivo y el router T19 lo mapea a 500)."""
         try:
-            template = self.jinja.get_template(template_name)
-        except Exception as exc:
-            raise GenerationError(
-                f"Plantilla no encontrada o inválida: '{template_name}': {exc}"
+            plantilla = self.jinja.get_template(nombre_plantilla)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Plantilla no encontrada o inválida: '{nombre_plantilla}': {exc}"
+            ) from exc
+        try:
+            return plantilla.render(**contexto)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"Error renderizando '{nombre_plantilla}': {exc}"
             ) from exc
 
-        try:
-            contenido = template.render(**ctx)
-        except Exception as exc:
-            raise GenerationError(
-                f"Error renderizando '{template_name}': {exc}"
-            ) from exc
-
-        destino.write_text(contenido, encoding="utf-8")
-
-    def _escribir_readme(
-        self, proyecto_dir: Path, ctx: dict[str, Any], mapeo: Any
-    ) -> None:
+    def _leeme(self, ctx: dict[str, Any], mapeo: MappingResult) -> str:
+        """README.md del proyecto generado (contenido del Ciclo 1)."""
         lineas = [
             f"# Backend generado por DevForge AI — trabajo #{ctx['trabajo_id']}",
             "",
@@ -341,268 +429,204 @@ class GeneratorService:
             "## Cómo ejecutarlo",
             "",
             "1. Crear una base de datos PostgreSQL.",
-            "2. Ajustar `src/main/resources/application.properties`.",
-            "3. `mvn spring-boot:run`",
+            "2. Ajustar `backend/src/main/resources/application.properties`.",
+            "3. `mvn spring-boot:run` dentro de `backend/`.",
             "",
-            "La colección Postman está en `postman/` para probar la API.",
+            "La colección Postman está en `backend/postman/` para probar la API.",
         ]
-        (proyecto_dir / "README.md").write_text("\n".join(lineas), encoding="utf-8")
+        return "\n".join(lineas)
 
-    # ------------------------------------------------------------------
-    # Persistencia del mapeo
-    # ------------------------------------------------------------------
-    async def _persistir_mapeo(
-        self, trabajo_id: int, diagrama: Any, mapeo: Any
-    ) -> None:
+    # ==================================================================
+    # Escritura y empaquetado (carpeta ÚNICA: nunca sobrescribe)
+    # ==================================================================
+    def _carpeta_destino(
+        self, nombre_proyecto: str, id_diagrama: PydanticObjectId
+    ) -> Path:
+        """Subcarpeta ÚNICA por generación (fecha con MICROSEGUNDOS + id
+        del diagrama: dos corridas del mismo diagrama nunca se pisan, ni
+        siquiera en el mismo segundo — el Ciclo 1 reutilizaba
+        generated_projects/{id}/ y hacía rmtree del destino)."""
+        marca = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        carpeta = (
+            Path(settings.GENERATED_PROJECTS_DIR)
+            / f"backend_{_a_recurso(nombre_proyecto)}_{str(id_diagrama)[:8]}_{marca}"
+        )
+        carpeta.mkdir(parents=True, exist_ok=True)
+        return carpeta
+
+    @staticmethod
+    def _escribir(carpeta: Path, archivos: dict[str, str]) -> None:
+        """Escribe cada archivo (creando las carpetas intermedias)."""
+        for ruta_relativa, contenido in archivos.items():
+            destino = carpeta / ruta_relativa
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            destino.write_text(contenido, encoding="utf-8")
+
+    @staticmethod
+    def _empaquetar(carpeta: Path) -> Path:
+        """ZIP del proyecto (junto a la carpeta, mismo nombre). El ZIP
+        contiene la carpeta raíz, lista para descomprimir y correr."""
+        ruta_zip = carpeta.with_suffix(".zip")
+        with zipfile.ZipFile(ruta_zip, "w", zipfile.ZIP_DEFLATED) as paquete:
+            for archivo in sorted(carpeta.rglob("*")):
+                if archivo.is_file():
+                    paquete.write(
+                        archivo, archivo.relative_to(carpeta.parent)
+                    )
+        return ruta_zip
+
+    # ==================================================================
+    # Resultado EMBEBIDO (antes _persistir_mapeo con bulk_create)
+    # ==================================================================
+    def _resultado_embebido(
+        self, diagrama: Diagrama, mapeo: MappingResult
+    ) -> list[EntidadGenerada]:
         """
-        Crea los registros `entidades_generadas` y `reglas_mapeo`.
-        Mapea por nombre de clase entre el diagrama ORM y las JavaEntity.
+        Mapea por nombre cada JavaEntity con su ClaseUML y arma:
+        EntidadGenerada(id_clase_uml=<uuid del embebido>,
+                        nombre_clase_java, nombre_tabla,
+                        reglas_mapeo=[ReglaMapeo(id_atributo_uml=<uuid>,
+                                                 columna, tipo_sql,
+                                                 pk, nulleable)]).
+
+        - La PK SINTÉTICA (clase sin atributo 'id') no tiene atributo UML:
+          no genera ReglaMapeo (igual que el Ciclo 1 con sus campos
+          sintéticos).
+        - En el Ciclo 1 esto hacía bulk_create + flush para obtener los ids
+          de las 3 tablas; en el Ciclo 2 todo viaja embebido en el trabajo
+          y se persiste con UN save() del padre.
         """
-        # Índice de clases UML por nombre en PascalCase
-        from app.code_generator.mapping_engine import MappingEngine
+        engine = MappingEngine()  # solo para los helpers de nombres
 
-        engine = MappingEngine()
-        clases_por_nombre = {
-            engine._a_pascal_case(getattr(c, "nombre", "")): c
-            for c in getattr(diagrama, "clases", []) or []
-        }
+        entidades_java = {e.nombre_clase_java: e for e in mapeo.entidades}
+        resultado: list[EntidadGenerada] = []
 
-        entidades_a_crear: list[EntidadGenerada] = []
-        reglas_por_entidad: dict[int, list[ReglaMapeo]] = {}
-
-        for ent in mapeo.entidades:
-            clase_uml = clases_por_nombre.get(ent.nombre_clase_java)
-            if clase_uml is None:
-                continue
-
-            eg = EntidadGenerada(
-                id_trabajo=trabajo_id,
-                id_clase_uml=clase_uml.id,
-                nombre_clase_java=ent.nombre_clase_java,
-                nombre_tabla=ent.nombre_tabla,
+        for clase in diagrama.clases:
+            entidad_java = entidades_java.get(
+                engine._a_pascal_case(clase.nombre)
             )
-            entidades_a_crear.append(eg)
-
-        # Crear entidades (flush para obtener ids)
-        entidades_creadas = await self.entidades.bulk_create(entidades_a_crear)
-
-        # Mapear nombre de entidad → objeto ORM
-        eg_por_nombre = {eg.nombre_clase_java: eg for eg in entidades_creadas}
-
-        # Crear reglas por cada campo (solo de atributos existentes en la clase)
-        for ent in mapeo.entidades:
-            eg = eg_por_nombre.get(ent.nombre_clase_java)
-            if eg is None:
-                continue
-            clase_uml = clases_por_nombre.get(ent.nombre_clase_java)
-            if clase_uml is None:
+            if entidad_java is None:
                 continue
 
-            # Índice atributos por nombre camel
-            atrib_por_java = {
-                engine._a_camel_case(getattr(a, "nombre", "")): a
-                for a in getattr(clase_uml, "atributos", []) or []
+            # Índice de atributos UML por nombre camelCase (igual que el
+            # Ciclo 1) para vincular cada campo Java con su uuid origen.
+            atributos_por_java = {
+                engine._a_camel_case(atributo.nombre): atributo
+                for atributo in clase.atributos
             }
 
             reglas: list[ReglaMapeo] = []
-            for campo in ent.campos:
-                attr = atrib_por_java.get(campo.nombre_java)
-                if attr is None:
-                    # Campo sintético (ej. id generado) → no tiene atributo UML
+            for campo in entidad_java.campos:
+                atributo = atributos_por_java.get(campo.nombre_java)
+                if atributo is None:
+                    # Campo sintético (la PK generada) → sin atributo UML.
                     continue
                 reglas.append(
                     ReglaMapeo(
-                        id_entidad_generada=eg.id,
-                        id_atributo_uml=attr.id,
+                        id_atributo_uml=atributo.id,
                         nombre_columna=campo.nombre_columna,
                         tipo_sql=campo.tipo_sql,
                         es_clave_primaria=campo.es_clave_primaria,
                         es_nulleable=campo.es_nulleable,
                     )
                 )
-            if reglas:
-                await self.reglas.bulk_create(reglas)
 
-    # ------------------------------------------------------------------
-    # Empaquetado ZIP
-    # ------------------------------------------------------------------
-    async def _empaquetar_zip(self, proyecto_dir: Path) -> Path:
-        """
-        Comprime `proyecto_dir/backend/` en `proyecto_dir/backend.zip`.
-        Devuelve la ruta del ZIP.
-        """
-        backend_dir = proyecto_dir / "backend"
-        zip_path = proyecto_dir / "backend.zip"
-
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for file in backend_dir.rglob("*"):
-                if file.is_file():
-                    zf.write(file, file.relative_to(backend_dir.parent))
-
-        return zip_path
+            resultado.append(
+                EntidadGenerada(
+                    id_clase_uml=clase.id,
+                    nombre_clase_java=entidad_java.nombre_clase_java,
+                    nombre_tabla=entidad_java.nombre_tabla,
+                    reglas_mapeo=reglas,
+                )
+            )
+        return resultado
 
     # ==================================================================
-    # Consultas y descarga
+    # Bitácora / notificaciones (mismas llamadas que el Ciclo 1)
     # ==================================================================
-    async def obtener_trabajo(
-        self, trabajo_id: int, *, usuario_id: int
-    ) -> TrabajoGeneracionDetalleResponse:
-        trabajo = await self.trabajos.get_detalle(trabajo_id)
-        if trabajo is None:
-            raise NotFoundError("Trabajo no encontrado")
-
-        diagrama = await self.diagramas.get_by_id(trabajo.id_diagrama)
-        await self._require_miembro(diagrama.id_proyecto, usuario_id)
-
-        return TrabajoGeneracionDetalleResponse.model_validate(trabajo)
-
-    async def listar_trabajos(
+    async def _log_generacion_exitosa(
         self,
-        diagrama_id: int,
+        trabajo: TrabajoGeneracionCodigo,
+        diagrama: Diagrama,
+        usuario_id: PydanticObjectId,
+    ) -> None:
+        """Bitácora del éxito. En el Ciclo 1 recibía el db y hacía
+        commit; en el Ciclo 2 el repositorio de Beanie persiste por
+        operación y basta llamar al service (los fallos NO tumban la
+        generación exitosa, igual que el Ciclo 1)."""
+        try:
+            from app.services.auditoria_service import AuditoriaService
+
+            await AuditoriaService().log_generacion_completada(
+                trabajo.id, diagrama.id, usuario_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("No se pudo registrar en bitácora: %s", exc)
+
+    async def _log_generacion_fallida(
+        self,
+        trabajo_id: PydanticObjectId,
+        diagrama: Diagrama,
+        usuario_id: PydanticObjectId,
         *,
-        usuario_id: int,
-        skip: int = 0,
-        limit: int = 50,
-    ) -> list[TrabajoGeneracionCodigoResponse]:
-        diagrama = await self.diagramas.get_by_id(diagrama_id)
-        if diagrama is None:
-            raise NotFoundError("Diagrama no encontrado")
-        await self._require_miembro(diagrama.id_proyecto, usuario_id)
-
-        items = await self.trabajos.list_by_diagrama(
-            diagrama_id, skip=skip, limit=limit
-        )
-        return [TrabajoGeneracionCodigoResponse.model_validate(t) for t in items]
-
-    async def obtener_url_descarga(
-        self, trabajo_id: int, *, usuario_id: int
-    ) -> DescargaProyectoResponse:
-        trabajo = await self.trabajos.get_by_id(trabajo_id)
-        if trabajo is None:
-            raise NotFoundError("Trabajo no encontrado")
-
-        diagrama = await self.diagramas.get_by_id(trabajo.id_diagrama)
-        await self._require_miembro(diagrama.id_proyecto, usuario_id)
-
-        if trabajo.estado != "EXITOSO":
-            raise GenerationError(
-                f"El trabajo no está listo (estado actual: {trabajo.estado})"
-            )
-
-        base = settings.BACKEND_PUBLIC_URL.rstrip("/")
-        url = f"{base}{settings.API_V1_PREFIX}/generacion/trabajos/{trabajo_id}/archivo"
-
-        # Tamaño si el ZIP existe
-        tamanio: Optional[int] = None
-        zip_path = Path(settings.GENERATED_PROJECTS_DIR) / str(trabajo.id) / "backend.zip"
-        if zip_path.is_file():
-            tamanio = zip_path.stat().st_size
-
-        return DescargaProyectoResponse(
-            id_trabajo=trabajo.id,
-            download_url=url,
-            tamanio_bytes=tamanio,
-            incluye_postman=True,
-        )
-
-    async def obtener_ruta_zip(
-        self, trabajo_id: int, *, usuario_id: int
-    ) -> str:
-        """Devuelve la ruta absoluta del ZIP para FileResponse."""
-        trabajo = await self.trabajos.get_by_id(trabajo_id)
-        if trabajo is None:
-            raise NotFoundError("Trabajo no encontrado")
-
-        diagrama = await self.diagramas.get_by_id(trabajo.id_diagrama)
-        await self._require_miembro(diagrama.id_proyecto, usuario_id)
-
-        if trabajo.estado != "EXITOSO":
-            raise GenerationError(
-                f"El trabajo no está listo (estado actual: {trabajo.estado})"
-            )
-
-        zip_path = (
-            Path(settings.GENERATED_PROJECTS_DIR)
-            / str(trabajo.id)
-            / "backend.zip"
-        )
-        if not zip_path.is_file():
-            raise NotFoundError("El archivo ZIP no está disponible")
-
-        return str(zip_path.resolve())
-
-    # ==================================================================
-    # Bitácora / notificaciones
-    # ==================================================================
-    async def _log_generacion_exitosa(self, trabajo: Any, usuario_id: int) -> None:
+        motivo: str = "",
+    ) -> None:
         try:
             from app.services.auditoria_service import AuditoriaService
 
-            auditoria = AuditoriaService(self.db)
-            await auditoria.log_generacion_completada(
-                trabajo.id, trabajo.id_diagrama, usuario_id, commit=False
+            await AuditoriaService().log_generacion_fallida(
+                trabajo_id, diagrama.id, usuario_id, motivo=motivo
             )
-            await self.db.commit()
-        except Exception as exc:
-            logger.warning("No se pudo registrar en bitácora: %s", exc)
-
-    async def _log_generacion_fallida(self, trabajo: Any, exc: Exception) -> None:
-        try:
-            from app.services.auditoria_service import AuditoriaService
-
-            auditoria = AuditoriaService(self.db)
-            await auditoria.log_generacion_fallida(
-                trabajo.id,
-                trabajo.id_diagrama,
-                trabajo.id_usuario,
-                motivo=str(exc),
-                commit=True,
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                "No se pudo registrar el fallo en bitácora: %s", exc
             )
-        except Exception as e:
-            logger.warning("No se pudo registrar fallo en bitácora: %s", e)
 
-    async def _notificar_exito(self, trabajo: Any, usuario_id: int) -> None:
+    async def _notificar_exito(
+        self,
+        trabajo: TrabajoGeneracionCodigo,
+        diagrama: Diagrama,
+        usuario_id: PydanticObjectId,
+    ) -> None:
+        """Notifica GENERACION_COMPLETA a los miembros del proyecto
+        (excluyendo al que disparó). En el Ciclo 1 id_referencia era INT;
+        en el Ciclo 2 es str (uuid del trabajo)."""
         try:
             from app.services.notificacion_service import NotificacionService
 
-            diagrama = await self.diagramas.get_by_id(trabajo.id_diagrama)
-            if diagrama is None:
-                return
-
-            notif = NotificacionService(self.db)
-            await notif.crear_para_miembros_de_proyecto(
+            await NotificacionService().crear_para_miembros_de_proyecto(
                 diagrama.id_proyecto,
                 tipo="GENERACION_COMPLETA",
                 mensaje=(
                     f"Backend generado listo para el diagrama "
                     f"'{diagrama.nombre}' (#{trabajo.id})"
                 ),
-                id_referencia=trabajo.id,
+                id_referencia=str(trabajo.id),
                 excluir_usuario_id=usuario_id,
-                commit=True,
             )
-        except Exception as exc:
-            logger.warning("No se pudo notificar la generación: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("No se pudo notificar la generación: %s", exc)
 
     # ==================================================================
-    # Helpers
+    # Permisos (mismo criterio defensivo del módulo C y de la T17)
     # ==================================================================
-    async def _require_miembro(self, proyecto_id: int, usuario_id: int) -> None:
+    async def _diagrama_para_lectura(
+        self,
+        id_diagrama: PydanticObjectId,
+        id_usuario: PydanticObjectId,
+    ) -> Diagrama:
+        """Diagrama existente + membresía de lectura. Ajeno → 404
+        genérico (no se revela existencia); inexistente → mensaje
+        explícito. (Ciclo 1: exigía EDITOR para crear el trabajo; Ciclo 2:
+        generar no muta el lienzo, basta LECTURA — misma decisión
+        documentada de la Tanda 17 para CU24.)"""
+        diagrama = await self.diagramas.get_by_id(id_diagrama)
+        if diagrama is None:
+            raise NotFoundError("Diagrama no encontrado")
+
         miembro = await self.miembros.get_by_proyecto_usuario(
-            proyecto_id, usuario_id
+            diagrama.id_proyecto, id_usuario
         )
         if miembro is None:
             raise NotFoundError("Recurso no encontrado")
-
-    async def _require_editor(self, proyecto_id: int, usuario_id: int) -> None:
-        miembro = await self.miembros.get_by_proyecto_usuario(
-            proyecto_id, usuario_id
-        )
-        if miembro is None:
-            raise NotFoundError("Recurso no encontrado")
-        if miembro.rol_en_proyecto not in ("PROPIETARIO", "EDITOR"):
-            from app.core.exceptions import ForbiddenError
-
-            raise ForbiddenError(
-                "Se requiere rol EDITOR o PROPIETARIO para generar el backend"
-            )
+        return diagrama

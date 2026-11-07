@@ -8,16 +8,25 @@ Cubre:
 - Consultar la bitácora con filtros y paginación (CU3).
 - Exportar la bitácora a Excel y PDF (streaming, sin persistir).
 
-Regla clave: el registro es fire-and-forget desde los demás servicios.
-`registrar()` acepta `commit=False` para incluirse en la transacción del
-llamador, o `commit=True` para autopersistirse.
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Servicio SIN ESTADO: sin AsyncSession. El registro es inmediato:
+  `evento.insert()` persiste en el momento, así que el parámetro
+  `commit` del Ciclo 1 DESAPARECE (no hay transacción que diferir; el
+  registro ya no puede "irse con el rollback" del llamador).
+- id_usuario → Optional[PydanticObjectId] (None = evento del sistema).
+- id_entidad_afectada (BIGINT polimórfico) → Optional[str]: str(ObjectId)
+  del Document o id uuid de un elemento embebido, según
+  `entidad_afectada`. Los helpers semánticos reciben el ObjectId y lo
+  guardan como str.
+- El sello de tiempo del PDF usa datetime.now(timezone.utc) (aware), en
+  lugar del utcnow() naive del Ciclo 1.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Optional, Sequence
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.core.exceptions import ValidationError
 from app.models.auditoria import BitacoraSistema
@@ -25,9 +34,10 @@ from app.repositories.auditoria_repository import BitacoraRepository
 
 
 class AuditoriaService:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-        self.bitacora = BitacoraRepository(db)
+    """Bitácora general del sistema: registro fire-and-forget + consulta."""
+
+    def __init__(self) -> None:
+        self.bitacora = BitacoraRepository()
 
     # ==================================================================
     # REGISTRO
@@ -37,20 +47,15 @@ class AuditoriaService:
         *,
         tipo_evento: str,
         descripcion: str,
-        id_usuario: Optional[int] = None,
+        id_usuario: Optional[PydanticObjectId] = None,
         entidad_afectada: Optional[str] = None,
-        id_entidad_afectada: Optional[int] = None,
-        commit: bool = False,
+        id_entidad_afectada: Optional[str] = None,
     ) -> BitacoraSistema:
         """
-        Registra un evento en la bitácora.
-
-        `commit=False` (por defecto) → el evento queda en la transacción
-        abierta del llamador. Si el llamador hace commit, se persiste;
-        si hace rollback, el evento se descarta.
-
-        `commit=True` → el evento se persiste en su propia transacción,
-        útil para eventos standalone (login, logout).
+        Registra un evento en la bitácora. En MongoDB el insert es
+        inmediato: el evento ya queda persistido al salir de este método
+        (el `commit` opcional del Ciclo 1 desaparece junto con las
+        transacciones).
         """
         if not tipo_evento or not tipo_evento.strip():
             raise ValidationError("El tipo de evento es obligatorio")
@@ -66,11 +71,8 @@ class AuditoriaService:
             ),
             id_entidad_afectada=id_entidad_afectada,
         )
+        # insert() persiste y asigna el ObjectId; sin commit/refresh
         evento = await self.bitacora.create(evento)
-
-        if commit:
-            await self.db.commit()
-            await self.db.refresh(evento)
 
         return evento
 
@@ -78,45 +80,46 @@ class AuditoriaService:
     # Helpers semánticos (atajos para los servicios llamadores)
     # ------------------------------------------------------------------
     async def log_login(
-        self, usuario_id: int, *, commit: bool = True
+        self, usuario_id: PydanticObjectId
     ) -> BitacoraSistema:
         return await self.registrar(
             tipo_evento="LOGIN",
             descripcion=f"El usuario #{usuario_id} inició sesión",
             id_usuario=usuario_id,
             entidad_afectada="USUARIO",
-            id_entidad_afectada=usuario_id,
-            commit=commit,
+            id_entidad_afectada=str(usuario_id),
         )
 
     async def log_registro(
-        self, usuario_id: int, *, commit: bool = True
+        self, usuario_id: PydanticObjectId
     ) -> BitacoraSistema:
         return await self.registrar(
             tipo_evento="USUARIO_REGISTRADO",
             descripcion=f"Se registró el usuario #{usuario_id}",
             id_usuario=usuario_id,
             entidad_afectada="USUARIO",
-            id_entidad_afectada=usuario_id,
-            commit=commit,
+            id_entidad_afectada=str(usuario_id),
         )
 
     async def log_proyecto_creado(
-        self, proyecto_id: int, usuario_id: int, nombre: str,
-        *, commit: bool = False,
+        self,
+        proyecto_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
+        nombre: str,
     ) -> BitacoraSistema:
         return await self.registrar(
             tipo_evento="PROYECTO_CREADO",
             descripcion=f"Proyecto '{nombre}' creado (#{proyecto_id})",
             id_usuario=usuario_id,
             entidad_afectada="PROYECTO",
-            id_entidad_afectada=proyecto_id,
-            commit=commit,
+            id_entidad_afectada=str(proyecto_id),
         )
 
     async def log_generacion_completada(
-        self, trabajo_id: int, diagrama_id: int, usuario_id: int,
-        *, commit: bool = False,
+        self,
+        trabajo_id: PydanticObjectId,
+        diagrama_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
     ) -> BitacoraSistema:
         return await self.registrar(
             tipo_evento="GENERACION_COMPLETADA",
@@ -126,14 +129,15 @@ class AuditoriaService:
             ),
             id_usuario=usuario_id,
             entidad_afectada="TRABAJO_GENERACION",
-            id_entidad_afectada=trabajo_id,
-            commit=commit,
+            id_entidad_afectada=str(trabajo_id),
         )
 
     async def log_generacion_fallida(
-        self, trabajo_id: int, diagrama_id: int, usuario_id: int,
+        self,
+        trabajo_id: PydanticObjectId,
+        diagrama_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
         motivo: str = "",
-        *, commit: bool = False,
     ) -> BitacoraSistema:
         desc = f"Generación #{trabajo_id} falló para el diagrama #{diagrama_id}"
         if motivo:
@@ -143,13 +147,14 @@ class AuditoriaService:
             descripcion=desc,
             id_usuario=usuario_id,
             entidad_afectada="TRABAJO_GENERACION",
-            id_entidad_afectada=trabajo_id,
-            commit=commit,
+            id_entidad_afectada=str(trabajo_id),
         )
 
     async def log_exportacion(
-        self, exportacion_id: int, diagrama_id: int, usuario_id: int,
-        *, commit: bool = False,
+        self,
+        exportacion_id: PydanticObjectId,
+        diagrama_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
     ) -> BitacoraSistema:
         return await self.registrar(
             tipo_evento="DIAGRAMA_EXPORTADO",
@@ -159,13 +164,14 @@ class AuditoriaService:
             ),
             id_usuario=usuario_id,
             entidad_afectada="DIAGRAMA",
-            id_entidad_afectada=diagrama_id,
-            commit=commit,
+            id_entidad_afectada=str(diagrama_id),
         )
 
     async def log_importacion(
-        self, importacion_id: int, diagrama_id: int, usuario_id: int,
-        *, commit: bool = False,
+        self,
+        importacion_id: PydanticObjectId,
+        diagrama_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
     ) -> BitacoraSistema:
         return await self.registrar(
             tipo_evento="DIAGRAMA_IMPORTADO",
@@ -175,8 +181,7 @@ class AuditoriaService:
             ),
             id_usuario=usuario_id,
             entidad_afectada="DIAGRAMA",
-            id_entidad_afectada=diagrama_id,
-            commit=commit,
+            id_entidad_afectada=str(diagrama_id),
         )
 
     # ==================================================================
@@ -187,7 +192,7 @@ class AuditoriaService:
         *,
         skip: int = 0,
         limit: int = 100,
-        id_usuario: Optional[int] = None,
+        id_usuario: Optional[PydanticObjectId] = None,
         tipo_evento: Optional[str] = None,
         entidad_afectada: Optional[str] = None,
         desde: Optional[datetime] = None,
@@ -219,7 +224,7 @@ class AuditoriaService:
         return items, total
 
     async def listar_por_entidad(
-        self, entidad_afectada: str, id_entidad_afectada: int
+        self, entidad_afectada: str, id_entidad_afectada: str
     ) -> Sequence[BitacoraSistema]:
         """Historial completo de eventos sobre un recurso concreto."""
         return await self.bitacora.list_by_entidad(
@@ -228,7 +233,7 @@ class AuditoriaService:
 
     async def listar_por_usuario(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         skip: int = 0,
         limit: int = 100,
@@ -243,7 +248,7 @@ class AuditoriaService:
     async def exportar_excel(
         self,
         *,
-        id_usuario: Optional[int] = None,
+        id_usuario: Optional[PydanticObjectId] = None,
         tipo_evento: Optional[str] = None,
         entidad_afectada: Optional[str] = None,
         desde: Optional[datetime] = None,
@@ -288,15 +293,15 @@ class AuditoriaService:
             ]
         )
 
-        # Filas
+        # Filas (los ObjectId se escriben como string hex)
         for e in items:
             ws.append(
                 [
-                    e.id,
+                    str(e.id),
                     e.created_at.strftime("%Y-%m-%d %H:%M:%S")
                     if e.created_at
                     else "",
-                    e.id_usuario if e.id_usuario else "",
+                    str(e.id_usuario) if e.id_usuario else "",
                     e.tipo_evento,
                     e.descripcion,
                     e.entidad_afectada or "",
@@ -312,7 +317,7 @@ class AuditoriaService:
     async def exportar_pdf(
         self,
         *,
-        id_usuario: Optional[int] = None,
+        id_usuario: Optional[PydanticObjectId] = None,
         tipo_evento: Optional[str] = None,
         entidad_afectada: Optional[str] = None,
         desde: Optional[datetime] = None,
@@ -363,7 +368,7 @@ class AuditoriaService:
         story.append(
             Paragraph(
                 f"Total de eventos: {total}  |  "
-                f"Generado: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                f"Generado: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
                 styles["Normal"],
             )
         )

@@ -7,13 +7,18 @@ Lógica de negocio de autenticación (módulo A. Usuarios y Seguridad):
 - Refresh de access token a partir de un refresh token válido
 - Cambio de contraseña por el propio usuario autenticado
 
-Regla de la capa de servicios: aquí SÍ se hace commit().
-Los repositorios solo hacen flush().
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- AuthService ya no recibe AsyncSession: los repositorios del Ciclo 2 son
+  SIN ESTADO (la conexión la lleva Beanie tras init_db()) y el service los
+  instancia una sola vez.
+- Desaparecen commit()/refresh(): usuario.insert() ya persiste y deja el
+  documento con su ObjectId asignado en memoria.
+- El JWT cambia de sujeto: en el Ciclo 1 el sub era el int del serial de
+  PostgreSQL (usuario_id = int(sub)); ahora sub = str(usuario.id) y
+  refrescar_token lo convierte de vuelta con PydanticObjectId(sub).
 """
 
-from datetime import timedelta
-
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.config import settings
 from app.core.exceptions import (
@@ -42,9 +47,8 @@ from app.schemas.usuario_schema import (
 
 
 class AuthService:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-        self.usuarios = UsuarioRepository(db)
+    def __init__(self) -> None:
+        self.usuarios = UsuarioRepository()
 
     # ------------------------------------------------------------------
     # Registro
@@ -66,9 +70,9 @@ class AuthService:
             activo=True,
         )
 
+        # Ciclo 1: create + commit + refresh. Ciclo 2: insert() persiste y
+        # deja el ObjectId en el documento; no hay nada que refrescar.
         usuario = await self.usuarios.create(usuario)
-        await self.db.commit()
-        await self.db.refresh(usuario)
 
         return UsuarioResponse.model_validate(usuario)
 
@@ -82,7 +86,9 @@ class AuthService:
         usuario = await self.usuarios.get_by_email(datos.email)
 
         # Mensaje genérico para no filtrar si el email existe o no.
-        if usuario is None or not verify_password(datos.password, usuario.password_hash):
+        if usuario is None or not verify_password(
+            datos.password, usuario.password_hash
+        ):
             raise UnauthorizedError("Credenciales inválidas")
 
         if not usuario.activo:
@@ -96,7 +102,8 @@ class AuthService:
     async def refrescar_token(self, refresh_token: str) -> TokenResponse:
         """
         Genera un nuevo par de tokens a partir de un refresh token válido.
-        El refresh token debe ser de tipo 'refresh' y pertenecer a un usuario activo.
+        El refresh token debe ser de tipo 'refresh' y pertenecer a un
+        usuario activo.
         """
         try:
             payload = decode_token(refresh_token)
@@ -111,7 +118,9 @@ class AuthService:
             raise UnauthorizedError("Refresh token inválido")
 
         try:
-            usuario_id = int(sub)
+            # Ciclo 1: usuario_id = int(sub). Ciclo 2: el sub es el ObjectId
+            # en hex que este service guarda como str(usuario.id).
+            usuario_id = PydanticObjectId(sub)
         except (TypeError, ValueError):
             raise UnauthorizedError("Refresh token inválido")
 
@@ -143,8 +152,8 @@ class AuthService:
             )
 
         usuario.password_hash = hash_password(datos.password_nueva)
+        # Ciclo 1: update + commit. Ciclo 2: save() persiste de inmediato.
         await self.usuarios.update(usuario)
-        await self.db.commit()
 
     # ------------------------------------------------------------------
     # Helpers internos
@@ -152,13 +161,13 @@ class AuthService:
     def _emitir_tokens(self, usuario: Usuario) -> TokenResponse:
         """Construye la respuesta estándar con access + refresh token."""
         access = create_access_token(
-            subject=usuario.id,
+            subject=str(usuario.id),  # Ciclo 2: ObjectId como cadena
             extra_claims={
                 "email": usuario.email,
                 "rol": usuario.rol,
             },
         )
-        refresh = create_refresh_token(subject=usuario.id)
+        refresh = create_refresh_token(subject=str(usuario.id))
 
         return TokenResponse(
             access_token=access,

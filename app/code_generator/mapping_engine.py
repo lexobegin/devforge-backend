@@ -1,9 +1,29 @@
 # app/code_generator/mapping_engine.py
 """
-Motor de mapeo objeto-relacional para la generación automática de backend.
+Motor de mapeo objeto-relacional para la generación automática de backend
+(módulo F, CU6) — CICLO 2.
 
-Traduce un Diagrama ORM (con clases UML, atributos, tipos UML, visibilidades)
-a un conjunto de estructuras listas para renderizar con Jinja2:
+RECONVERTIDO del Ciclo 1 conservando TODAS las reglas de mapeo (mismas
+tablas de tipos, misma detección de PK, mismos sanitizadores de nombres).
+Lo único que cambia es lo que ALREDEDOR del engine es distinto:
+
+- ENTRADA: en el Ciclo 1 recibía los objetos SQLAlchemy del diagrama; en
+  el Ciclo 2 recibe el Diagrama Beanie con los elementos EMBEBIDOS
+  (ClaseUML/AtributoUML/RelacionUML). El engine sigue leyendo atributos
+  por nombre (getattr) y NO importa Beanie ni SQLAlchemy: sigue siendo
+  testeable sin base de datos y agnóstico del ORM.
+- IDs: id_clase_origen/id_clase_destino de RelacionUML pasaron de FK INT
+  a STR uuid de los embebidos (ClaseUML.id) — la comparación de
+  _adjuntar_relacion funciona igual con uuid.
+- SANITIZADORES (hallazgo del arnés de la T17, ahora también aquí): los
+  nombres se limpian con NFD ANTES de partir palabras, para que 'Clínica
+  V2' genere clase Java 'ClinicaV2' y tabla 'clinica_v2s' (ASCII puro) y
+  no 'ClínicaV2' / 'cl_nica…' ni archivos con tildes.
+- Limpieza menor: TIPO_MAP del Ciclo 1 tenía la clave "Double" DUPLICADA
+  (mismo valor dos veces) — se deja una sola.
+
+Traduce un diagrama (clases UML, atributos, tipos UML, visibilidades) a
+un conjunto de estructuras listas para renderizar con Jinja2:
 
 - JavaEntity: la clase @Entity JPA con sus columnas.
 - JavaField: atributo → campo Java + columna SQL.
@@ -19,6 +39,7 @@ Reglas aplicadas (resumen):
 """
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -42,7 +63,6 @@ TIPO_MAP: dict[str, tuple[str, str]] = {
     "Short": ("Short", "SMALLINT"),
     # Decimales
     "Float": ("Float", "REAL"),
-    "Double": ("Double", "DOUBLE PRECISION"),
     "Double": ("Double", "DOUBLE PRECISION"),
     "BigDecimal": ("BigDecimal", "NUMERIC(19,4)"),
     "Decimal": ("BigDecimal", "NUMERIC(19,4)"),
@@ -73,6 +93,16 @@ IMPORTS_JAVA: dict[str, list[str]] = {
     "LocalTime": ["java.time.LocalTime"],
     "BigDecimal": ["java.math.BigDecimal"],
     "UUID": ["java.util.UUID"],
+}
+
+# Lookup MAYÚSCULA-INSENSITIVO (Ciclo 2): en el lienzo embebido los
+# primitivos se escriben en minúsculas ('str', 'int', 'float', 'bool'),
+# mientras que el TIPO_MAP del Ciclo 1 los traía capitalizados ('String',
+# 'Float', 'Boolean'…). Todas las claves colapsan a los MISMOS valores
+# (no hay colisiones con distinto destino), así que el lookup normalizado
+# es seguro y deja de degradar 'float' a Long/BIGINT por una mayúscula.
+TIPO_MAP_MINUSCULAS: dict[str, tuple[str, str]] = {
+    clave.lower(): valor for clave, valor in TIPO_MAP.items()
 }
 
 # Nombres que se reservan para evitar colisiones con campos JPA
@@ -124,10 +154,12 @@ class MappingResult:
 # ======================================================================
 class MappingEngine:
     """
-    Traduce un diagrama ORM a estructuras Java.
+    Traduce un diagrama a estructuras Java.
 
-    La clase no depende de SQLAlchemy: recibe objetos ya cargados y lee
-    atributos por nombre. Esto la hace testeable sin base de datos.
+    La clase NO depende de Beanie ni de SQLAlchemy: recibe objetos ya
+    cargados y lee atributos por nombre (getattr). Esto la hace testeable
+    sin base de datos y le permite consumir tanto el Diagrama embebido
+    del Ciclo 2 como los objetos del Ciclo 1.
     """
 
     def __init__(self, package_base: str = "com.devforge.generated"):
@@ -281,6 +313,11 @@ class MappingEngine:
         if t in TIPO_MAP:
             return TIPO_MAP[t]
 
+        # Ciclo 2: el lienzo escribe los primitivos en minúsculas
+        # ('float', 'bool'…). Mismo destino que su clave capitalizada.
+        if t.lower() in TIPO_MAP_MINUSCULAS:
+            return TIPO_MAP_MINUSCULAS[t.lower()]
+
         # Tipos genéricos: List<String>, Set<Integer>, Optional<X> …
         m = re.match(r"^(List|Set|Collection|Optional)<(.+)>$", t)
         if m:
@@ -308,6 +345,8 @@ class MappingEngine:
         'id_<destino>' en la entidad origen.
 
         Nota: esta es una versión conservadora; ampliable en el futuro.
+        (Ciclo 2: id_clase_origen/destino son los uuid str de los
+        ClaseUML embebidos — la comparación con clase.id es directa.)
         """
         clase_origen_id = getattr(relacion, "id_clase_origen", None)
         clase_destino_id = getattr(relacion, "id_clase_destino", None)
@@ -346,16 +385,29 @@ class MappingEngine:
     # Helpers de nombres
     # ------------------------------------------------------------------
     @staticmethod
-    def _a_pascal_case(nombre: str) -> str:
+    def _sin_acentos(texto: str) -> str:
+        """'Clínica' → 'Clinica' (NFD separa el acento y se descarta).
+        Hallazgo del arnés de la T17 extendido al backend: los nombres
+        Java/SQL/archivos generados quedan en ASCII puro aunque el nombre
+        UML lleve tildes/ñ."""
+        return "".join(
+            c
+            for c in unicodedata.normalize("NFD", texto or "")
+            if unicodedata.category(c) != "Mn"
+        )
+
+    @classmethod
+    def _a_pascal_case(cls, nombre: str) -> str:
         """
         'historia_clinica' → 'HistoriaClinica'
         'Historia Clinica'  → 'HistoriaClinica'
         'paciente'          → 'Paciente'
+        'Clínica V2'        → 'ClinicaV2'   (sin acentos: hallazgo T17)
         """
         if not nombre:
             return "Entity"
-        # Separar por _, espacio, guion
-        partes = re.split(r"[\s_\-]+", nombre.strip())
+        # Separar por _, espacio, guion (sobre el nombre sin acentos)
+        partes = re.split(r"[\s_\-]+", cls._sin_acentos(nombre).strip())
         partes = [p for p in partes if p]
         # Si ya viene en PascalCase o camelCase, respetar la forma
         if len(partes) == 1:
@@ -363,15 +415,16 @@ class MappingEngine:
             return p[0].upper() + p[1:] if p else "Entity"
         return "".join(p[0].upper() + p[1:] if p else "" for p in partes)
 
-    @staticmethod
-    def _a_camel_case(nombre: str) -> str:
+    @classmethod
+    def _a_camel_case(cls, nombre: str) -> str:
         """
         'nombre_completo' → 'nombreCompleto'
         'Fecha Nacimiento' → 'fechaNacimiento'
+        'Índice Masa'      → 'indiceMasa'  (sin acentos: hallazgo T17)
         """
         if not nombre:
             return "campo"
-        partes = re.split(r"[\s_\-]+", nombre.strip())
+        partes = re.split(r"[\s_\-]+", cls._sin_acentos(nombre).strip())
         partes = [p for p in partes if p]
         if not partes:
             return "campo"
@@ -382,28 +435,29 @@ class MappingEngine:
         resto = "".join(p[0].upper() + p[1:] if p else "" for p in partes[1:])
         return primera + resto
 
-    @staticmethod
-    def _a_snake_case(nombre: str) -> str:
+    @classmethod
+    def _a_snake_case(cls, nombre: str) -> str:
         """
         'NombreCompleto' → 'nombre_completo'
         'fechaNacimiento' → 'fecha_nacimiento'
+        'Clínica V2'      → 'clinica_v2'  (sin acentos: hallazgo T17)
         """
         if not nombre:
             return "columna"
         # Insertar _ antes de mayúsculas internas
-        s = re.sub(r"(?<!^)(?=[A-Z])", "_", nombre.strip())
+        s = re.sub(r"(?<!^)(?=[A-Z])", "_", cls._sin_acentos(nombre).strip())
         s = re.sub(r"[\s\-]+", "_", s)
         s = re.sub(r"_+", "_", s).strip("_")
         return s.lower() or "columna"
 
-    @staticmethod
-    def _a_snake_case_plural(nombre: str) -> str:
+    @classmethod
+    def _a_snake_case_plural(cls, nombre: str) -> str:
         """
         'HistoriaClinica' → 'historia_clinicas'
         'Paciente' → 'pacientes'
         Si ya termina en 's', no duplica la 's'.
         """
-        base = MappingEngine._a_snake_case(nombre)
+        base = cls._a_snake_case(nombre)
         if base.endswith("s"):
             return base
         return base + "s"

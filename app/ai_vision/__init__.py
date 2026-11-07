@@ -10,6 +10,10 @@ de clases y reconstrucción como elementos editables.
 
 Este módulo corre del lado del BACKEND (requiere más cómputo que el
 reconocimiento de voz offline, que vive en el dispositivo móvil).
+
+CICLO 2: el paquete se conserva TAL CUAL del Ciclo 1 — es Python puro
+(cv2/numpy/pytesseract con degradación elegante; sin SQLAlchemy ni
+Beanie), igual que postman_export.py en la Tanda 18.
 """
 
 from app.ai_vision.vision_service import VisionService

@@ -5,6 +5,11 @@ Routers de la API v1 de DevForge AI.
 Cada router expone los endpoints de un módulo funcional y delega la
 lógica de negocio en `app/services/`. Los routers NO contienen lógica de
 negocio: solo validan entrada, llaman al servicio y formatean la salida.
+
+CICLO 2: misma estructura y los MISMOS 13 routers que el Ciclo 1 (el
+__all__ no cambia para no romper el include_router de main.py). Cada
+router ya no recibe AsyncSession: los services se instancian sin sesión
+y los ids de ruta son PydanticObjectId (str de ObjectId en el JSON).
 """
 
 # --- A. Usuarios y Seguridad ---

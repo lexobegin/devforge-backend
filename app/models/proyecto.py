@@ -1,132 +1,52 @@
 # app/models/proyecto.py
 """
-Modelos ORM del módulo B. Proyectos y Colaboración (parte 1):
+Documentos del módulo B. Proyectos y Colaboración (parte 1) — CICLO 2.
 
-- Proyecto           → proyectos de software que un equipo modela/genera.
-- MiembroProyecto    → usuarios que pertenecen a un proyecto y su rol.
+- Proyecto        → proyectos de software que un equipo modela/genera
+                    (colección "proyectos").
+- MiembroProyecto → usuario que pertenece a un proyecto y su rol
+                    (documento EMBEBIDO dentro de Proyecto.miembros).
+
+Cambios respecto al Ciclo 1 (tablas PostgreSQL → documentos MongoDB):
+- La tabla miembros_proyecto desaparece como colección: cada miembro va
+  EMBEBIDO dentro de su proyecto (Proyecto.miembros) como modelo pydantic
+  (en Beanie los documentos embebidos son BaseModel). Leer el proyecto
+  devuelve sus miembros sin joins.
+- La unicidad (id_proyecto, id_usuario) del Ciclo 1
+  (uq_miembro_proyecto_usuario) se garantiza en la capa de servicios
+  consultando Proyecto.miembro(id_usuario) antes de insertar.
+- id_propietario guarda el ObjectId del usuario propietario (antes FK a
+  usuarios.id); el índice se declara en Settings.indexes.
+- Las relationships de SQLAlchemy (propietario, miembros) desaparecen: el
+  propietario se resuelve con Usuario.get(self.id_propietario).
 """
 
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Literal, Optional
 
-from sqlalchemy import (
-    DateTime,
-    ForeignKey,
-    String,
-    Text,
-    UniqueConstraint,
-    func,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from beanie import Document, PydanticObjectId
+from pydantic import BaseModel, Field
 
-from app.database import Base
+# Literales que reemplazan a los CHECK del Ciclo 1
+RolEnProyecto = Literal["PROPIETARIO", "EDITOR", "LECTOR"]
+EstadoProyecto = Literal["ACTIVO", "ARCHIVADO"]
 
 
 # ======================================================================
-# Proyecto
+# MiembroProyecto (embebido)
 # ======================================================================
-class Proyecto(Base):
-    __tablename__ = "proyectos"
+class MiembroProyecto(BaseModel):  # embebido: los embebidos de Beanie son pydantic
+    """Miembro de un proyecto (antes tabla miembros_proyecto)."""
 
     # ------------------------------------------------------------------
-    # Columnas
+    # Campos (antes columnas de la tabla miembros_proyecto)
     # ------------------------------------------------------------------
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    id_usuario: PydanticObjectId
 
-    nombre: Mapped[str] = mapped_column(String(150), nullable=False)
+    rol_en_proyecto: RolEnProyecto = "EDITOR"
 
-    descripcion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    id_propietario: Mapped[int] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-
-    estado: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="ACTIVO", server_default="ACTIVO"
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
-    )
-
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    propietario: Mapped["Usuario"] = relationship(  # noqa: F821
-        "Usuario",
-        back_populates="proyectos_propios",
-        foreign_keys=[id_propietario],
-    )
-
-    miembros: Mapped[list["MiembroProyecto"]] = relationship(
-        "MiembroProyecto",
-        back_populates="proyecto",
-        cascade="all, delete-orphan",
-    )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    @property
-    def esta_activo(self) -> bool:
-        return self.estado == "ACTIVO"
-
-    def __repr__(self) -> str:
-        return f"<Proyecto id={self.id} nombre={self.nombre!r} estado={self.estado!r}>"
-
-
-# ======================================================================
-# MiembroProyecto
-# ======================================================================
-class MiembroProyecto(Base):
-    __tablename__ = "miembros_proyecto"
-    __table_args__ = (
-        UniqueConstraint("id_proyecto", "id_usuario", name="uq_miembro_proyecto_usuario"),
-    )
-
-    # ------------------------------------------------------------------
-    # Columnas
-    # ------------------------------------------------------------------
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_proyecto: Mapped[int] = mapped_column(
-        ForeignKey("proyectos.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    id_usuario: Mapped[int] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-
-    rol_en_proyecto: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="EDITOR", server_default="EDITOR"
-    )
-
-    joined_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
-    )
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    proyecto: Mapped["Proyecto"] = relationship(
-        "Proyecto", back_populates="miembros"
-    )
-
-    usuario: Mapped["Usuario"] = relationship(  # noqa: F821
-        "Usuario", back_populates="membresias"
+    joined_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
     )
 
     # ------------------------------------------------------------------
@@ -138,6 +58,69 @@ class MiembroProyecto(Base):
 
     def __repr__(self) -> str:
         return (
-            f"<MiembroProyecto proyecto={self.id_proyecto} "
-            f"usuario={self.id_usuario} rol={self.rol_en_proyecto!r}>"
+            f"<MiembroProyecto usuario={self.id_usuario} "
+            f"rol={self.rol_en_proyecto!r}>"
+        )
+
+
+# ======================================================================
+# Proyecto
+# ======================================================================
+class Proyecto(Document):
+    """Proyecto de software (colección "proyectos")."""
+
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla proyectos)
+    # ------------------------------------------------------------------
+    nombre: str
+
+    descripcion: Optional[str] = None
+
+    id_propietario: PydanticObjectId
+
+    estado: EstadoProyecto = "ACTIVO"
+
+    # Miembros EMBEBIDOS (antes tabla miembros_proyecto)
+    miembros: list[MiembroProyecto] = Field(default_factory=list)
+
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    # ------------------------------------------------------------------
+    # Configuración del documento
+    # ------------------------------------------------------------------
+    class Settings:
+        name = "proyectos"
+        indexes = ["id_propietario"]   # índice que tenía la FK en PostgreSQL
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @property
+    def esta_activo(self) -> bool:
+        return self.estado == "ACTIVO"
+
+    def miembro(
+        self, id_usuario: PydanticObjectId
+    ) -> Optional[MiembroProyecto]:
+        """Devuelve la membresía del usuario en el proyecto (o None).
+
+        Es la puerta de entrada al control de permisos: los routers y
+        servicios consultan aquí antes de permitir editar, generar o
+        administrar (verifica también la unicidad uq_miembro del Ciclo 1).
+        """
+        for miembro in self.miembros:
+            if miembro.id_usuario == id_usuario:
+                return miembro
+        return None
+
+    def __repr__(self) -> str:
+        return (
+            f"<Proyecto id={self.id} nombre={self.nombre!r} "
+            f"estado={self.estado!r}>"
         )

@@ -3,33 +3,51 @@
 Esquemas Pydantic del módulo F. Generación Automática de Backend:
 
 - TrabajoGeneracionCodigo
-- EntidadGenerada
-- ReglaMapeo
+- EntidadGenerada   (EMBEDIDA en TrabajoGeneracionCodigo.entidades)
+- ReglaMapeo        (EMBEDIDA en EntidadGenerada.reglas_mapeo)
 
 Además incluye los DTOs de operación:
 - GenerarBackendRequest     → payload para disparar una generación
 - EstadoGeneracionResponse  → estado resumido para polling desde el front
+
+Cambios respecto al Ciclo 1:
+- entidades_generadas y reglas_mapeo desaparecen como tablas: están
+  EMBEBIDAS en el trabajo (trabajo → entidades[] → reglas_mapeo[]).
+  Por eso sus *Response pierden id propio, id_trabajo e id_entidad_generada:
+  la anidación da el alcance y los ids vienen del documento Trabajo.
+- id_clase_uml / id_atributo_uml pasan de FK int a str uuid de los elementos
+  embebidos del Diagrama (ClaseUML.id, AtributoUML.id).
+- EstadoGeneracion unifica EstadoTrabajoGeneracion del Ciclo 1 con el
+  Literal de app/models/generacion.py (mismos 4 estados).
+- StackDestino sigue siendo Literal de un solo valor en el schema (valida la
+  entrada del cliente); el modelo acepta texto libre porque CU24 añadirá
+  "REACT_TS_VITE" al generar el frontend React.
+- TrabajoGeneracionDetalleResponse ya no necesita ensamblar nada a mano:
+  model_validate(trabajo) trae entidades y reglas anidadas (antes 3 tablas
+  con joins).
 """
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
+from beanie import PydanticObjectId
 from pydantic import BaseModel, ConfigDict, Field
 
 
 # ======================================================================
-# Tipos reutilizables
+# Tipos reutilizables (alineados con app/models/generacion.py)
 # ======================================================================
-EstadoTrabajoGeneracion = Literal["PENDIENTE", "EN_PROCESO", "EXITOSO", "FALLIDO"]
+EstadoGeneracion = Literal["PENDIENTE", "EN_PROCESO", "EXITOSO", "FALLIDO"]
 
 StackDestino = Literal["SPRING_BOOT_JPA_POSTGRES"]
 
 
 # ======================================================================
-# ReglaMapeo
+# ReglaMapeo (embebida)
 # ======================================================================
 class ReglaMapeoBase(BaseModel):
-    id_atributo_uml: int = Field(..., gt=0)
+    # id uuid del AtributoUML embebido del diagrama (antes FK a atributos_uml).
+    id_atributo_uml: str = Field(..., min_length=1)
     nombre_columna: str = Field(..., min_length=1, max_length=100)
     tipo_sql: str = Field(..., min_length=1, max_length=50)
     es_clave_primaria: bool = Field(default=False)
@@ -39,15 +57,16 @@ class ReglaMapeoBase(BaseModel):
 class ReglaMapeoResponse(ReglaMapeoBase):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    id_entidad_generada: int
+    # Sin id ni id_entidad_generada: es embebida de EntidadGeneradaResponse
+    # y la anidación da el alcance
 
 
 # ======================================================================
-# EntidadGenerada
+# EntidadGenerada (embebida)
 # ======================================================================
 class EntidadGeneradaBase(BaseModel):
-    id_clase_uml: int = Field(..., gt=0)
+    # id uuid del ClaseUML embebido del diagrama (antes FK a clases_uml).
+    id_clase_uml: str = Field(..., min_length=1)
     nombre_clase_java: str = Field(..., min_length=1, max_length=150)
     nombre_tabla: str = Field(..., min_length=1, max_length=150)
 
@@ -55,8 +74,7 @@ class EntidadGeneradaBase(BaseModel):
 class EntidadGeneradaResponse(EntidadGeneradaBase):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    id_trabajo: int
+    # Sin id ni id_trabajo: es embebida de TrabajoGeneracionDetalleResponse
     reglas_mapeo: list[ReglaMapeoResponse] = Field(default_factory=list)
 
 
@@ -77,10 +95,10 @@ class TrabajoGeneracionCodigoCreate(TrabajoGeneracionCodigoBase):
 class TrabajoGeneracionCodigoResponse(TrabajoGeneracionCodigoBase):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    id_diagrama: int
-    id_usuario: int
-    estado: EstadoTrabajoGeneracion
+    id: PydanticObjectId  # string hex en JSON (antes int serial)
+    id_diagrama: PydanticObjectId
+    id_usuario: PydanticObjectId
+    estado: EstadoGeneracion
     ruta_salida: Optional[str] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -88,7 +106,11 @@ class TrabajoGeneracionCodigoResponse(TrabajoGeneracionCodigoBase):
 
 
 class TrabajoGeneracionDetalleResponse(TrabajoGeneracionCodigoResponse):
-    """Trabajo con el detalle completo de sus entidades y reglas de mapeo."""
+    """
+    Trabajo con el detalle completo de sus entidades y reglas de mapeo.
+    En el Ciclo 2 se construye directo con model_validate(trabajo): el
+    resultado vive embebido en el documento (antes 3 tablas con joins).
+    """
 
     entidades: list[EntidadGeneradaResponse] = Field(default_factory=list)
 
@@ -127,8 +149,8 @@ class EstadoGeneracionResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    estado: EstadoTrabajoGeneracion
+    id: PydanticObjectId
+    estado: EstadoGeneracion
     progreso: Optional[int] = Field(
         None,
         ge=0,
@@ -143,7 +165,7 @@ class EstadoGeneracionResponse(BaseModel):
 class DescargaProyectoResponse(BaseModel):
     """Respuesta al pedir la descarga del backend generado."""
 
-    id_trabajo: int
+    id_trabajo: PydanticObjectId  # string hex en JSON (antes int serial)
     download_url: str = Field(..., description="URL para descargar el ZIP del backend")
     tamanio_bytes: Optional[int] = Field(None, ge=0)
     incluye_postman: bool = True

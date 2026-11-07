@@ -1,0 +1,45 @@
+// Generado por DevForge AI (CU24) — formulario de {{ ent.nombre }}
+import type { FormEvent } from "react";
+import { crear{{ ent.nombre }} } from "../api/{{ ent.recurso }}";
+import type { {{ ent.nombre }} } from "../tipos/{{ ent.recurso }}";
+
+function valor(form: FormData, campo: string, tipo: string): unknown {
+  const crudo = form.get(campo);
+  if (crudo === null) {
+    return undefined;
+  }
+  if (tipo === "number") {
+    return Number(crudo);
+  }
+  if (tipo === "checkbox") {
+    return crudo === "on" || crudo === "true";
+  }
+  return String(crudo);
+}
+
+export default function {{ ent.nombre }}Formulario() {
+  async function enviar(evento: FormEvent<HTMLFormElement>) {
+    evento.preventDefault();
+    const formulario = evento.currentTarget;
+    const form = new FormData(formulario);
+    const datos = {
+{% for a in ent.atributos %}
+      {{ a.nombre_js }}: valor(form, "{{ a.nombre_js }}", "{{ a.tipo_input }}") as {{ a.tipo_ts }},
+{% endfor %}
+    };
+    await crear{{ ent.nombre }}(datos as Omit<{{ ent.nombre }}, "id">);
+    formulario.reset();
+  }
+
+  return (
+    <form onSubmit={enviar}>
+{% for a in ent.atributos %}
+      <label>
+        {{ a.nombre_original }}
+        <input name="{{ a.nombre_js }}" type="{{ a.tipo_input }}" />
+      </label>
+{% endfor %}
+      <button type="submit">Guardar {{ ent.nombre }}</button>
+    </form>
+  );
+}

@@ -1,0 +1,10 @@
+// Generado por DevForge AI (CU24) — tipos de {{ ent.nombre }}
+// Mapeo UML → TypeScript: str→string, int/float→number, bool→boolean;
+// cualquier otro tipo UML se degrada a string (decisión del generador).
+
+export interface {{ ent.nombre }} {
+  id?: string;
+{% for a in ent.atributos %}
+  {{ a.nombre_js }}: {{ a.tipo_ts }};
+{% endfor %}
+}

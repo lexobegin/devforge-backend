@@ -1,6 +1,6 @@
 # app/api/v1/diagramas_router.py
 """
-Endpoints del módulo C. Modelado UML (Diagrama de Clases).
+Endpoints del módulo C. Modelado UML (Diagrama de Clases) — CICLO 2.
 
 Diagramas:
 - GET    /api/v1/diagramas/proyecto/{proyecto_id}   → listar por proyecto
@@ -43,13 +43,21 @@ Relaciones:
 - POST   /api/v1/diagramas/{id}/relaciones
 - PUT    /api/v1/diagramas/relaciones/{relacion_id}
 - DELETE /api/v1/diagramas/relaciones/{relacion_id}
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession (el DiagramaService
+de la Tanda 9 trabaja sobre los EMBEBIDOS del documento Diagrama con el
+patrón fetch → modificar → save del PADRE); ids de diagrama
+PydanticObjectId; los ids de clase/atributo/operación/parámetro/interfaz/
+relación son el uuid str del elemento embebido (igual que el Ciclo 1
+usaba ints de tabla propia, aquí cambian a uuid str). Los errores de
+dominio del service (NotFoundError/ValidationError/ForbiddenError/
+ConflictError) los traduce el manejador de app/core/exceptions.py.
 """
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_current_active_user
-from app.database import get_db
 from app.models.usuario import Usuario
 from app.schemas.diagrama_schema import (
     AtributoUMLCreate,
@@ -92,11 +100,10 @@ router = APIRouter()
     summary="Listar diagramas de un proyecto",
 )
 async def listar_diagramas(
-    proyecto_id: int,
+    proyecto_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.listar_por_proyecto(
         proyecto_id, usuario_id=current_user.id
     )
@@ -109,12 +116,11 @@ async def listar_diagramas(
     summary="Crear diagrama en un proyecto",
 )
 async def crear_diagrama(
-    proyecto_id: int,
+    proyecto_id: PydanticObjectId,
     datos: DiagramaCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> DiagramaResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.crear(
         proyecto_id, datos, usuario_id=current_user.id
     )
@@ -126,11 +132,10 @@ async def crear_diagrama(
     summary="Obtener diagrama (metadata)",
 )
 async def obtener_diagrama(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> DiagramaResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.obtener(diagrama_id, usuario_id=current_user.id)
 
 
@@ -144,11 +149,10 @@ async def obtener_diagrama(
     ),
 )
 async def obtener_diagrama_completo(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> DiagramaCompletoResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.obtener_completo(
         diagrama_id, usuario_id=current_user.id
     )
@@ -160,12 +164,11 @@ async def obtener_diagrama_completo(
     summary="Actualizar metadata del diagrama",
 )
 async def actualizar_diagrama(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     datos: DiagramaUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> DiagramaResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.actualizar(
         diagrama_id, datos, usuario_id=current_user.id
     )
@@ -177,11 +180,10 @@ async def actualizar_diagrama(
     summary="Eliminar diagrama (y todo su contenido en cascada)",
 )
 async def eliminar_diagrama(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = DiagramaService(db)
+    service = DiagramaService()
     await service.eliminar(diagrama_id, usuario_id=current_user.id)
 
 
@@ -194,11 +196,10 @@ async def eliminar_diagrama(
     summary="Listar clases del diagrama",
 )
 async def listar_clases(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.listar_clases(diagrama_id, usuario_id=current_user.id)
 
 
@@ -213,12 +214,11 @@ async def listar_clases(
     ),
 )
 async def crear_clase(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     datos: ClaseUMLCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ClaseUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.crear_clase(
         diagrama_id, datos, usuario_id=current_user.id
     )
@@ -231,11 +231,10 @@ async def crear_clase(
     summary="Obtener clase con atributos y operaciones",
 )
 async def obtener_clase(
-    clase_id: int,
+    clase_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ClaseUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.obtener_clase(clase_id, usuario_id=current_user.id)
 
 
@@ -245,12 +244,11 @@ async def obtener_clase(
     summary="Actualizar clase",
 )
 async def actualizar_clase(
-    clase_id: int,
+    clase_id: str,
     datos: ClaseUMLUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ClaseUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.actualizar_clase(
         clase_id, datos, usuario_id=current_user.id
     )
@@ -262,11 +260,10 @@ async def actualizar_clase(
     summary="Eliminar clase (y relaciones asociadas)",
 )
 async def eliminar_clase(
-    clase_id: int,
+    clase_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = DiagramaService(db)
+    service = DiagramaService()
     await service.eliminar_clase(clase_id, usuario_id=current_user.id)
 
 
@@ -279,11 +276,10 @@ async def eliminar_clase(
     summary="Listar atributos de una clase",
 )
 async def listar_atributos(
-    clase_id: int,
+    clase_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.listar_atributos(clase_id, usuario_id=current_user.id)
 
 
@@ -294,12 +290,11 @@ async def listar_atributos(
     summary="Agregar atributo a una clase",
 )
 async def agregar_atributo(
-    clase_id: int,
+    clase_id: str,
     datos: AtributoUMLCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> AtributoUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.agregar_atributo(
         clase_id, datos, usuario_id=current_user.id
     )
@@ -311,12 +306,11 @@ async def agregar_atributo(
     summary="Actualizar atributo",
 )
 async def actualizar_atributo(
-    atributo_id: int,
+    atributo_id: str,
     datos: AtributoUMLUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> AtributoUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.actualizar_atributo(
         atributo_id, datos, usuario_id=current_user.id
     )
@@ -328,11 +322,10 @@ async def actualizar_atributo(
     summary="Eliminar atributo",
 )
 async def eliminar_atributo(
-    atributo_id: int,
+    atributo_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = DiagramaService(db)
+    service = DiagramaService()
     await service.eliminar_atributo(atributo_id, usuario_id=current_user.id)
 
 
@@ -345,11 +338,10 @@ async def eliminar_atributo(
     summary="Listar operaciones de una clase",
 )
 async def listar_operaciones(
-    clase_id: int,
+    clase_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.listar_operaciones(clase_id, usuario_id=current_user.id)
 
 
@@ -360,12 +352,11 @@ async def listar_operaciones(
     summary="Agregar operación (con parámetros anidados) a una clase",
 )
 async def agregar_operacion(
-    clase_id: int,
+    clase_id: str,
     datos: OperacionUMLCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> OperacionUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.agregar_operacion(
         clase_id, datos, usuario_id=current_user.id
     )
@@ -377,12 +368,11 @@ async def agregar_operacion(
     summary="Actualizar operación",
 )
 async def actualizar_operacion(
-    operacion_id: int,
+    operacion_id: str,
     datos: OperacionUMLUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> OperacionUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.actualizar_operacion(
         operacion_id, datos, usuario_id=current_user.id
     )
@@ -394,11 +384,10 @@ async def actualizar_operacion(
     summary="Eliminar operación (y sus parámetros)",
 )
 async def eliminar_operacion(
-    operacion_id: int,
+    operacion_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = DiagramaService(db)
+    service = DiagramaService()
     await service.eliminar_operacion(operacion_id, usuario_id=current_user.id)
 
 
@@ -412,12 +401,11 @@ async def eliminar_operacion(
     summary="Agregar parámetro a una operación",
 )
 async def agregar_parametro(
-    operacion_id: int,
+    operacion_id: str,
     datos: ParametroOperacionUMLCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ParametroOperacionUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.agregar_parametro(
         operacion_id, datos, usuario_id=current_user.id
     )
@@ -429,12 +417,11 @@ async def agregar_parametro(
     summary="Actualizar parámetro",
 )
 async def actualizar_parametro(
-    parametro_id: int,
+    parametro_id: str,
     datos: ParametroOperacionUMLUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ParametroOperacionUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.actualizar_parametro(
         parametro_id, datos, usuario_id=current_user.id
     )
@@ -446,11 +433,10 @@ async def actualizar_parametro(
     summary="Eliminar parámetro",
 )
 async def eliminar_parametro(
-    parametro_id: int,
+    parametro_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = DiagramaService(db)
+    service = DiagramaService()
     await service.eliminar_parametro(parametro_id, usuario_id=current_user.id)
 
 
@@ -464,12 +450,11 @@ async def eliminar_parametro(
     summary="Crear interfaz en el diagrama (con operaciones anidadas)",
 )
 async def crear_interfaz(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     datos: InterfazUMLCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> InterfazUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.crear_interfaz(
         diagrama_id, datos, usuario_id=current_user.id
     )
@@ -481,12 +466,11 @@ async def crear_interfaz(
     summary="Actualizar interfaz",
 )
 async def actualizar_interfaz(
-    interfaz_id: int,
+    interfaz_id: str,
     datos: InterfazUMLUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> InterfazUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.actualizar_interfaz(
         interfaz_id, datos, usuario_id=current_user.id
     )
@@ -498,11 +482,10 @@ async def actualizar_interfaz(
     summary="Eliminar interfaz",
 )
 async def eliminar_interfaz(
-    interfaz_id: int,
+    interfaz_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = DiagramaService(db)
+    service = DiagramaService()
     await service.eliminar_interfaz(interfaz_id, usuario_id=current_user.id)
 
 
@@ -513,12 +496,11 @@ async def eliminar_interfaz(
     summary="Agregar operación a una interfaz",
 )
 async def agregar_op_interfaz(
-    interfaz_id: int,
+    interfaz_id: str,
     datos: OperacionInterfazUMLCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> OperacionInterfazUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.agregar_op_interfaz(
         interfaz_id, datos, usuario_id=current_user.id
     )
@@ -530,12 +512,11 @@ async def agregar_op_interfaz(
     summary="Actualizar operación de interfaz",
 )
 async def actualizar_op_interfaz(
-    operacion_id: int,
+    operacion_id: str,
     datos: OperacionInterfazUMLUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> OperacionInterfazUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.actualizar_op_interfaz(
         operacion_id, datos, usuario_id=current_user.id
     )
@@ -547,11 +528,10 @@ async def actualizar_op_interfaz(
     summary="Eliminar operación de interfaz",
 )
 async def eliminar_op_interfaz(
-    operacion_id: int,
+    operacion_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = DiagramaService(db)
+    service = DiagramaService()
     await service.eliminar_op_interfaz(operacion_id, usuario_id=current_user.id)
 
 
@@ -564,11 +544,10 @@ async def eliminar_op_interfaz(
     summary="Listar relaciones del diagrama",
 )
 async def listar_relaciones(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.listar_relaciones(diagrama_id, usuario_id=current_user.id)
 
 
@@ -583,12 +562,11 @@ async def listar_relaciones(
     ),
 )
 async def crear_relacion(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     datos: RelacionUMLCreate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> RelacionUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.crear_relacion(
         diagrama_id, datos, usuario_id=current_user.id
     )
@@ -600,12 +578,11 @@ async def crear_relacion(
     summary="Actualizar relación",
 )
 async def actualizar_relacion(
-    relacion_id: int,
+    relacion_id: str,
     datos: RelacionUMLUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> RelacionUMLResponse:
-    service = DiagramaService(db)
+    service = DiagramaService()
     return await service.actualizar_relacion(
         relacion_id, datos, usuario_id=current_user.id
     )
@@ -617,9 +594,8 @@ async def actualizar_relacion(
     summary="Eliminar relación",
 )
 async def eliminar_relacion(
-    relacion_id: int,
+    relacion_id: str,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = DiagramaService(db)
+    service = DiagramaService()
     await service.eliminar_relacion(relacion_id, usuario_id=current_user.id)
