@@ -7,16 +7,28 @@ Convención:
 - *Create     → entrada para creación
 - *Update     → entrada para actualización parcial (todos opcionales)
 - *Response   → salida hacia el cliente (nunca expone password_hash)
+
+Cambios respecto al Ciclo 1:
+- id pasa de int (serial de PostgreSQL) a PydanticObjectId; Beanie lo
+  serializa como string hex en JSON, así que el frontend y el móvil
+  siguen recibiendo un string.
+- RolGlobal incorpora "LIDER": el modelo Usuario del Ciclo 2 reconoce
+  explícitamente al Líder de Proyecto (además de ADMIN y DESARROLLADOR).
+- from_attributes=True sigue siendo válido: los Document de Beanie son
+  modelos pydantic, por lo que UsuarioResponse.model_validate(usuario)
+  funciona directo y NUNCA expone password_hash (el campo no se declara
+  en el esquema de salida).
 """
 
 from datetime import datetime
 from typing import Literal, Optional
 
+from beanie import PydanticObjectId
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
-# Tipos reutilizables
-RolGlobal = Literal["ADMIN", "DESARROLLADOR"]
+# Tipos reutilizables (alineados con app/models/usuario.py)
+RolGlobal = Literal["ADMIN", "LIDER", "DESARROLLADOR"]
 
 
 # ======================================================================
@@ -62,7 +74,7 @@ class UsuarioUpdate(BaseModel):
 class UsuarioResponse(UsuarioBase):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: PydanticObjectId  # string hex en JSON (antes int serial)
     rol: RolGlobal
     activo: bool
     created_at: datetime

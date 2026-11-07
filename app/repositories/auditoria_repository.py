@@ -2,37 +2,43 @@
 """
 Repositorio de acceso a datos del módulo de Auditoría:
 
-- BitacoraRepository → tabla `bitacora_sistema`
+- BitacoraRepository → colección `bitacora_sistema`
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Ya no recibe AsyncSession: repositorio SIN ESTADO (la conexión la lleva
+  Beanie tras app/mongo.init_db()).
+- id_usuario es Optional[PydanticObjectId]: None = evento disparado por el
+  propio sistema (el ON DELETE SET NULL del Ciclo 1 desaparece: en MongoDB
+  no hay cascadas).
+- id_entidad_afectada pasa de BIGINT a str: str(ObjectId) de un Document o
+  uuid de un elemento embebido, según `entidad_afectada`.
+- list_paginado/count_con_filtros arman UNA lista de condiciones y hacen
+  UNA consulta find(...) (antes se encadenaba .where sobre el statement).
 """
 
 from datetime import datetime
 from typing import Optional, Sequence
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.models.auditoria import BitacoraSistema
 
 
 class BitacoraRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
-    async def get_by_id(self, evento_id: int) -> Optional[BitacoraSistema]:
-        result = await self.db.execute(
-            select(BitacoraSistema).where(BitacoraSistema.id == evento_id)
-        )
-        return result.scalar_one_or_none()
+    async def get_by_id(
+        self, evento_id: PydanticObjectId
+    ) -> Optional[BitacoraSistema]:
+        return await BitacoraSistema.get(evento_id)
 
     async def list_paginado(
         self,
         *,
         skip: int = 0,
         limit: int = 100,
-        id_usuario: Optional[int] = None,
+        id_usuario: Optional[PydanticObjectId] = None,
         tipo_evento: Optional[str] = None,
         entidad_afectada: Optional[str] = None,
         desde: Optional[datetime] = None,
@@ -43,81 +49,81 @@ class BitacoraRepository:
         el endpoint de la bitácora del sistema (CU3) — el admin filtra
         por fecha, usuario, tipo de evento, etc.
         """
-        stmt = (
-            select(BitacoraSistema)
-            .order_by(BitacoraSistema.created_at.desc())
-            .offset(skip)
-            .limit(limit)
-        )
+        condiciones = []
         if id_usuario is not None:
-            stmt = stmt.where(BitacoraSistema.id_usuario == id_usuario)
+            condiciones.append(BitacoraSistema.id_usuario == id_usuario)
         if tipo_evento is not None:
-            stmt = stmt.where(BitacoraSistema.tipo_evento == tipo_evento)
+            condiciones.append(BitacoraSistema.tipo_evento == tipo_evento)
         if entidad_afectada is not None:
-            stmt = stmt.where(BitacoraSistema.entidad_afectada == entidad_afectada)
+            condiciones.append(
+                BitacoraSistema.entidad_afectada == entidad_afectada
+            )
         if desde is not None:
-            stmt = stmt.where(BitacoraSistema.created_at >= desde)
+            condiciones.append(BitacoraSistema.created_at >= desde)
         if hasta is not None:
-            stmt = stmt.where(BitacoraSistema.created_at <= hasta)
-
-        result = await self.db.execute(stmt)
-        return result.scalars().all()
+            condiciones.append(BitacoraSistema.created_at <= hasta)
+        return await (
+            BitacoraSistema.find(*condiciones)
+            .sort(-BitacoraSistema.created_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
+        )
 
     async def count_con_filtros(
         self,
         *,
-        id_usuario: Optional[int] = None,
+        id_usuario: Optional[PydanticObjectId] = None,
         tipo_evento: Optional[str] = None,
         entidad_afectada: Optional[str] = None,
         desde: Optional[datetime] = None,
         hasta: Optional[datetime] = None,
     ) -> int:
         """Conteo total respetando los mismos filtros (para paginación)."""
-        stmt = select(func.count(BitacoraSistema.id))
+        condiciones = []
         if id_usuario is not None:
-            stmt = stmt.where(BitacoraSistema.id_usuario == id_usuario)
+            condiciones.append(BitacoraSistema.id_usuario == id_usuario)
         if tipo_evento is not None:
-            stmt = stmt.where(BitacoraSistema.tipo_evento == tipo_evento)
+            condiciones.append(BitacoraSistema.tipo_evento == tipo_evento)
         if entidad_afectada is not None:
-            stmt = stmt.where(BitacoraSistema.entidad_afectada == entidad_afectada)
+            condiciones.append(
+                BitacoraSistema.entidad_afectada == entidad_afectada
+            )
         if desde is not None:
-            stmt = stmt.where(BitacoraSistema.created_at >= desde)
+            condiciones.append(BitacoraSistema.created_at >= desde)
         if hasta is not None:
-            stmt = stmt.where(BitacoraSistema.created_at <= hasta)
-        result = await self.db.execute(stmt)
-        return int(result.scalar_one())
+            condiciones.append(BitacoraSistema.created_at <= hasta)
+        return await BitacoraSistema.find(*condiciones).count()
 
     async def list_by_entidad(
         self,
         entidad_afectada: str,
-        id_entidad_afectada: int,
+        id_entidad_afectada: str,
     ) -> Sequence[BitacoraSistema]:
         """Historial de eventos de un recurso concreto (ej. un diagrama)."""
-        result = await self.db.execute(
-            select(BitacoraSistema)
-            .where(
+        return await (
+            BitacoraSistema.find(
                 BitacoraSistema.entidad_afectada == entidad_afectada,
                 BitacoraSistema.id_entidad_afectada == id_entidad_afectada,
             )
-            .order_by(BitacoraSistema.created_at.desc())
+            .sort(-BitacoraSistema.created_at)
+            .to_list()
         )
-        return result.scalars().all()
 
     async def list_by_usuario(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         skip: int = 0,
         limit: int = 100,
     ) -> Sequence[BitacoraSistema]:
-        result = await self.db.execute(
-            select(BitacoraSistema)
-            .where(BitacoraSistema.id_usuario == usuario_id)
-            .order_by(BitacoraSistema.created_at.desc())
-            .offset(skip)
+        return await (
+            BitacoraSistema.find(BitacoraSistema.id_usuario == usuario_id)
+            .sort(-BitacoraSistema.created_at)
+            .skip(skip)
             .limit(limit)
+            .to_list()
         )
-        return result.scalars().all()
 
     async def list_by_tipo_evento(
         self,
@@ -126,24 +132,20 @@ class BitacoraRepository:
         skip: int = 0,
         limit: int = 100,
     ) -> Sequence[BitacoraSistema]:
-        result = await self.db.execute(
-            select(BitacoraSistema)
-            .where(BitacoraSistema.tipo_evento == tipo_evento)
-            .order_by(BitacoraSistema.created_at.desc())
-            .offset(skip)
+        return await (
+            BitacoraSistema.find(BitacoraSistema.tipo_evento == tipo_evento)
+            .sort(-BitacoraSistema.created_at)
+            .skip(skip)
             .limit(limit)
+            .to_list()
         )
-        return result.scalars().all()
 
     # ------------------------------------------------------------------
     # Escrituras
     # ------------------------------------------------------------------
     async def create(self, evento: BitacoraSistema) -> BitacoraSistema:
-        self.db.add(evento)
-        await self.db.flush()
-        await self.db.refresh(evento)
+        await evento.insert()
         return evento
 
     async def delete(self, evento: BitacoraSistema) -> None:
-        await self.db.delete(evento)
-        await self.db.flush()
+        await evento.delete()

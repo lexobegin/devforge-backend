@@ -1,14 +1,31 @@
 # app/main.py
 """
-Punto de entrada de DevForge AI (backend FastAPI, Capa 1).
+Punto de entrada de DevForge AI (backend FastAPI, Capa 1) — CICLO 2.
 
 Responsabilidades:
 - Crear la instancia FastAPI con metadata y documentación.
 - Configurar CORS, middleware y manejadores de errores.
-- Registrar todos los routers de la API v1.
-- Registrar el router WebSocket de colaboración.
+- Registrar todos los routers de la API v1 (los MISMOS 13 del Ciclo 1).
+- Registrar el router WebSocket de colaboración (agregador de app/websocket).
 - Exponer endpoints base (root + health).
-- Registrar los hooks de ciclo de vida (DB init/close).
+- Registrar los hooks de ciclo de vida (MongoDB init/close).
+
+Cambios respecto al Ciclo 1:
+- PostgreSQL/SQLAlchemy → MongoDB (app.mongo init_db/close_db, Tanda 2).
+- Los 13 routers se CONSERVAN (app/api/v1/__init__.py de la Tanda 19):
+  el módulo G es `ia_router`, refundado como AGENTE DEV (Tandas 15-16):
+  POST /proyectos/{proyecto_id}/prompt deriva al orquestador si el payload
+  trae id_diagrama, o al CHAT GENERAL si no; las acciones se confirman con
+  POST /acciones/confirmar (EjecutorAccionesService).
+  NOTA: el borrador de la Tanda 2 registraba `canal_router` y
+  `asistente_router` como routers separados; esa división NO se materializó
+  (Tanda 19): ambos roles viven en ia_router + ai_vision_router.
+- La IA de VISIÓN (boceto → UML completo) va en ai_vision_router.
+- WebSocket: se monta el AGREGADOR `router` del paquete app/websocket
+  (Tanda 19b), ruta /ws/diagramas/{diagrama_id}.
+- La generación de proyectos generados y las descargas XMI se sirven desde
+  los propios routers (FileResponse sobre GENERATED_PROJECTS_DIR / EXPORT_DIR):
+  NO hace falta StaticFiles en main.
 """
 
 import logging
@@ -19,7 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.core.exceptions import register_exception_handlers
-from app.database import close_db, init_db
+from app.mongo import close_db, init_db
 
 # ----------------------------------------------------------------------
 # Logging
@@ -35,12 +52,12 @@ logger = logging.getLogger("devforge")
 async def lifespan(app: FastAPI):
     logger.info("Iniciando DevForge AI backend (env=%s)", settings.APP_ENV)
     await init_db()
-    logger.info("Conexión a PostgreSQL verificada.")
+    logger.info("Conexión a MongoDB verificada.")
     try:
         yield
     finally:
         await close_db()
-        logger.info("Conexión a PostgreSQL cerrada. Hasta luego.")
+        logger.info("Conexión a MongoDB cerrada. Hasta luego.")
 
 
 # ----------------------------------------------------------------------
@@ -51,8 +68,10 @@ app = FastAPI(
     version=settings.APP_VERSION,
     description=(
         "Backend de la plataforma CASE colaborativa DevForge AI: "
-        "usuarios, proyectos, modelado UML colaborativo, trazabilidad, "
-        "generación automática de backend Spring Boot, IA asistente y "
+        "usuarios, proyectos, modelado UML colaborativo (UML 2.5.1), "
+        "trazabilidad, generación automática de backend Spring Boot y "
+        "frontend React, Agente Dev (IA de equipo en el canal), "
+        "Asistente Guía (aprendizaje de la herramienta), voz local y "
         "sincronización offline."
     ),
     docs_url="/docs" if not settings.IS_PRODUCTION else None,
@@ -81,7 +100,7 @@ register_exception_handlers(app)
 
 
 # ----------------------------------------------------------------------
-# Routers (API v1)
+# Routers (API v1) — los MISMOS 13 routers que el Ciclo 1 (Tanda 19)
 # ----------------------------------------------------------------------
 from app.api.v1 import (  # noqa: E402
     ai_vision_router,
@@ -151,11 +170,11 @@ app.include_router(
     tags=["Generación de Código"],
 )
 
-# --- G. IA ---
+# --- G. IA (Agente Dev en el canal + Asistente Guía + prompt voz/texto) ---
 app.include_router(
     ia_router.router,
     prefix=f"{settings.API_V1_PREFIX}/ia",
-    tags=["IA (voz/texto)"],
+    tags=["IA (Agente Dev)"],
 )
 app.include_router(
     ai_vision_router.router,
@@ -186,11 +205,10 @@ app.include_router(
 
 
 # ----------------------------------------------------------------------
-# WebSocket (colaboración en tiempo real)
+# WebSocket (colaboración en tiempo real) — agregador del paquete (Tanda 19b)
 # ----------------------------------------------------------------------
-# Se activará cuando implementemos app/websocket/collaboration_ws.py
-from app.websocket import collaboration_ws
-app.include_router(collaboration_ws.router)
+from app.websocket import router as ws_router  # noqa: E402
+app.include_router(ws_router)
 
 
 # ----------------------------------------------------------------------

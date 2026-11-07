@@ -1,5 +1,12 @@
 # ============================================================
-# DevForge AI — Backend (FastAPI + Python 3.10.10)
+# DevForge AI — Backend (FastAPI + Python 3.10.10) — CICLO 2
+# Cambios respecto al Ciclo 1:
+#   - FUERA: sqlalchemy, asyncpg, psycopg2-binary, alembic (no hay BD SQL)
+#   - NUEVO: beanie + motor (MongoDB async), dnspython (URIs mongodb+srv)
+#   - NUEVO: faster-whisper (transcripción de voz local, CU5/CU16)
+#   - NUEVO: lxml (compatibilidad XMI real con Enterprise Architect, Punto 3)
+#   - httpx pasa de "no usado" a obligatorio (clientes REST de Ollama /
+#     OpenAI-compatible / Gemini del LlmProvider)
 # ============================================================
 
 # --- Framework web / ASGI ---
@@ -7,20 +14,17 @@ fastapi==0.115.0
 starlette==0.38.6
 uvicorn[standard]==0.31.0
 gunicorn==22.0.0
-
-# --- Servidor de producción (workers ASGI) ---
 # Se instala uvicorn[standard] arriba, que ya trae uvicorn.workers.UvicornWorker
 
 # --- Pydantic v2 y validación ---
 pydantic==2.9.2
-pydantic-settings==2.5.2
+pydantic-settings==2.7.1
 email-validator==2.2.0
 
-# --- Base de datos (async) ---
-sqlalchemy[asyncio]==2.0.35
-asyncpg==0.29.0
-psycopg2-binary==2.9.9        # solo para Alembic (URL sync)
-alembic==1.13.2
+# --- Base de datos (MongoDB async) ---
+beanie==1.26.0                # ODM async (documentos, índices y agregaciones)
+motor==3.6.0                  # driver async oficial (requerido por Beanie)
+dnspython==2.7.0              # soporte de URIs mongodb+srv
 
 # --- Seguridad ---
 python-jose[cryptography]==3.3.0
@@ -28,21 +32,25 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.2.0
 python-multipart==0.0.12      # para endpoints con UploadFile / Form
 
-# --- IA de visión (bocetos) ---
+# --- IA local (Ciclo 2): LlmProvider + embeddings + voz ---
+httpx==0.27.2                 # REST de Ollama (/api/chat, /api/embeddings), OpenAI-compat y Gemini
+faster-whisper==1.0.3         # transcripción de voz local (trae ctranslate2 como dependencia)
+
+# --- IA de visión (bocetos) — se conserva del Ciclo 1, ahora interpretada por el LLM local ---
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
 pillow==10.4.0
 pytesseract==0.3.13
 
+# --- Intercambio XMI compatible con Enterprise Architect (Ciclo 2) ---
+lxml==5.3.0                   # parsing/escritura XMI 2.1 robusta (namespaces de EA)
+
 # --- Exportación de bitácora ---
 openpyxl==3.1.5               # exportar a Excel
 reportlab==4.2.2              # exportar a PDF
 
-# --- Plantillas (generación Spring Boot) ---
+# --- Plantillas (generación Spring Boot Ciclo 1 + React CRUD Ciclo 2) ---
 jinja2==3.1.4
-
-# --- HTTP cliente (para IA externa, no usado por defecto) ---
-httpx==0.27.2
 
 # --- Utilidades ---
 python-dotenv==1.0.1

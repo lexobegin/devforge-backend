@@ -1,70 +1,60 @@
 # app/models/intercambio.py
 """
-Modelos ORM del módulo E. Intercambio de Modelos (XMI/XML):
+Documentos del módulo E. Intercambio de Modelos (XMI/XML) — CICLO 2.
 
-- ExportacionDiagrama  → registro de una exportación del diagrama a un archivo externo.
-- ImportacionDiagrama  → registro de una importación de un modelo externo
-                         hacia la plataforma.
+- ExportacionDiagrama → registro de una exportación del diagrama a un archivo
+                        externo (colección "exportaciones_diagrama").
+- ImportacionDiagrama → registro de una importación de un modelo externo
+                        hacia la plataforma (colección "importaciones_diagrama").
 
-Alineado 1:1 con el script SQL (módulo E).
+Cambios respecto al Ciclo 1 (tablas PostgreSQL → documentos MongoDB):
+- Ambas tablas se conservan como COLECCIONES SEPARADAS: son bitácoras de
+  intercambio que crecen linealmente con el uso (embeberlas haría crecer el
+  diagrama sin límite).
+- Los ids pasan de FK INT a ObjectIds con índice (id_diagrama, id_usuario).
+- En el Ciclo 2 estos registros documentan el round-trip DevForge ↔
+  Enterprise Architect: el conversor XMI (lxml) los llena al terminar cada
+  operación, con estado EXITOSO/FALLIDO — trazabilidad que el Ciclo 1 no
+  daba para depurar la compatibilidad con EA.
 """
 
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Literal
 
-from sqlalchemy import (
-    CheckConstraint,
-    DateTime,
-    ForeignKey,
-    String,
-    func,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from beanie import Document, PydanticObjectId
+from pydantic import Field
 
-from app.database import Base
+# Literal que reemplaza al CHECK ck_importacion_estado del Ciclo 1
+EstadoImportacion = Literal["PENDIENTE", "EXITOSO", "FALLIDO"]
 
 
 # ======================================================================
 # ExportacionDiagrama
 # ======================================================================
-class ExportacionDiagrama(Base):
-    __tablename__ = "exportaciones_diagrama"
+class ExportacionDiagrama(Document):
+    """Exportación de un diagrama (colección "exportaciones_diagrama")."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla exportaciones_diagrama)
+    # ------------------------------------------------------------------
+    id_diagrama: PydanticObjectId
 
-    id_diagrama: Mapped[int] = mapped_column(
-        ForeignKey("diagramas.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    formato: str = "XMI"
 
-    formato: Mapped[str] = mapped_column(
-        String(10), nullable=False, default="XMI", server_default="XMI"
-    )
+    ruta_archivo: str
 
-    ruta_archivo: Mapped[str] = mapped_column(String(255), nullable=False)
+    id_usuario: PydanticObjectId
 
-    id_usuario: Mapped[int] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-
-    exported_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
+    exported_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
     )
 
     # ------------------------------------------------------------------
-    # Relaciones
+    # Configuración del documento
     # ------------------------------------------------------------------
-    diagrama: Mapped["Diagrama"] = relationship(  # noqa: F821
-        "Diagrama",
-        foreign_keys=[id_diagrama],
-    )
-
-    usuario: Mapped["Usuario"] = relationship(  # noqa: F821
-        "Usuario",
-        foreign_keys=[id_usuario],
-    )
+    class Settings:
+        name = "exportaciones_diagrama"  # mismo nombre que la tabla del Ciclo 1
+        indexes = ["id_diagrama"]
 
     def __repr__(self) -> str:
         return (
@@ -76,54 +66,43 @@ class ExportacionDiagrama(Base):
 # ======================================================================
 # ImportacionDiagrama
 # ======================================================================
-class ImportacionDiagrama(Base):
-    __tablename__ = "importaciones_diagrama"
-    __table_args__ = (
-        CheckConstraint(
-            "estado IN ('PENDIENTE','EXITOSO','FALLIDO')",
-            name="ck_importacion_estado",
-        ),
-    )
+class ImportacionDiagrama(Document):
+    """Importación de un modelo externo (colección "importaciones_diagrama")."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla importaciones_diagrama)
+    # ------------------------------------------------------------------
+    id_diagrama: PydanticObjectId
 
-    id_diagrama: Mapped[int] = mapped_column(
-        ForeignKey("diagramas.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    formato: str = "XMI"
 
-    formato: Mapped[str] = mapped_column(
-        String(10), nullable=False, default="XMI", server_default="XMI"
-    )
+    archivo_origen: str
 
-    archivo_origen: Mapped[str] = mapped_column(String(255), nullable=False)
+    estado: EstadoImportacion = "PENDIENTE"
 
-    estado: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="PENDIENTE", server_default="PENDIENTE"
-    )
+    id_usuario: PydanticObjectId
 
-    id_usuario: Mapped[int] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-
-    imported_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
+    imported_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
     )
 
     # ------------------------------------------------------------------
-    # Relaciones
+    # Configuración del documento
     # ------------------------------------------------------------------
-    diagrama: Mapped["Diagrama"] = relationship(  # noqa: F821
-        "Diagrama",
-        foreign_keys=[id_diagrama],
-    )
+    class Settings:
+        name = "importaciones_diagrama"  # mismo nombre que la tabla del Ciclo 1
+        indexes = ["id_diagrama"]
 
-    usuario: Mapped["Usuario"] = relationship(  # noqa: F821
-        "Usuario",
-        foreign_keys=[id_usuario],
-    )
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @property
+    def exitoso(self) -> bool:
+        return self.estado == "EXITOSO"
+
+    @property
+    def fallo(self) -> bool:
+        return self.estado == "FALLIDO"
 
     def __repr__(self) -> str:
         return (

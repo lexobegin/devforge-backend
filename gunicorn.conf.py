@@ -5,6 +5,14 @@ Configuración de Gunicorn para DevForge AI (producción).
 Ejecuta la app FastAPI usando UvicornWorker (ASGI).
 Comando típico:
     gunicorn app.main:app -c gunicorn.conf.py
+
+Notas Ciclo 2:
+- El cliente Motor + init_beanie se crean en el LIFESPAN de cada worker
+  (app/main.py), es decir, DESPUÉS del fork: no hay handles de conexión
+  compartidos entre procesos (requisito de Motor). preload_app=True es
+  seguro porque app/mongo.py no crea nada al importar.
+- Los índices de MongoDB los crea init_beanie en cada arranque de worker
+  (create_index es idempotente: no hay migraciones Alembic que correr).
 """
 
 import multiprocessing

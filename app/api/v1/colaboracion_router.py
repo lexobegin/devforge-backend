@@ -1,6 +1,6 @@
 # app/api/v1/colaboracion_router.py
 """
-Endpoints REST auxiliares del módulo B. Colaboración.
+Endpoints REST auxiliares del módulo B. Colaboración — CICLO 2.
 
 La colaboración en TIEMPO REAL se hace por WebSocket (ver
 `app/websocket/collaboration_ws.py`). Estos endpoints REST son para:
@@ -20,13 +20,16 @@ Endpoints:
 - PUT    /api/v1/colaboracion/sesiones/{sesion_id}/cursor        → actualizar cursor
 - DELETE /api/v1/colaboracion/sesiones/{sesion_id}               → cerrar sesión
 - DELETE /api/v1/colaboracion/diagramas/{diagrama_id}/sesiones   → cerrar todas
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession; ids de ruta
+PydanticObjectId; el cursor se persiste como dict JSON (antes JSONB de
+PostgreSQL); errores de dominio traducidos por app/core/exceptions.py.
 """
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_current_active_user
-from app.database import get_db
 from app.models.usuario import Usuario
 from app.schemas.colaboracion_schema import (
     ParticipanteSesionResponse,
@@ -52,11 +55,10 @@ router = APIRouter()
     ),
 )
 async def abrir_sesion(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> SesionColaboracionResponse:
-    service = ColaboracionService(db)
+    service = ColaboracionService()
     return await service.abrir_o_obtener_sesion(
         diagrama_id, usuario_id=current_user.id
     )
@@ -68,11 +70,10 @@ async def abrir_sesion(
     summary="Obtener sesión con sus participantes",
 )
 async def obtener_sesion(
-    sesion_id: int,
+    sesion_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> SesionConParticipantesResponse:
-    service = ColaboracionService(db)
+    service = ColaboracionService()
     return await service.obtener_sesion_con_participantes(
         sesion_id, usuario_id=current_user.id
     )
@@ -92,11 +93,10 @@ async def obtener_sesion(
     ),
 )
 async def unirse(
-    sesion_id: int,
+    sesion_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ParticipanteSesionResponse:
-    service = ColaboracionService(db)
+    service = ColaboracionService()
     return await service.unir_participante(
         sesion_id, usuario_id=current_user.id
     )
@@ -112,11 +112,10 @@ async def unirse(
     ),
 )
 async def salir(
-    sesion_id: int,
+    sesion_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = ColaboracionService(db)
+    service = ColaboracionService()
     await service.salir_participante(sesion_id, usuario_id=current_user.id)
 
 
@@ -129,11 +128,10 @@ async def salir(
     summary="Listar participantes conectados de una sesión",
 )
 async def listar_participantes(
-    sesion_id: int,
+    sesion_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = ColaboracionService(db)
+    service = ColaboracionService()
     return await service.listar_participantes_conectados(
         sesion_id, usuario_id=current_user.id
     )
@@ -149,11 +147,10 @@ async def listar_participantes(
     ),
 )
 async def listar_conectados_por_diagrama(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = ColaboracionService(db)
+    service = ColaboracionService()
     return await service.listar_conectados_por_diagrama(
         diagrama_id, usuario_id=current_user.id
     )
@@ -168,16 +165,15 @@ async def listar_conectados_por_diagrama(
     summary="Actualizar la posición del cursor en el lienzo",
     description=(
         "Fallback HTTP del evento WS `cursor_moved`. Persiste la posición "
-        "JSONB del cursor del participante actual."
+        "JSON del cursor del participante actual."
     ),
 )
 async def actualizar_cursor(
-    sesion_id: int,
+    sesion_id: PydanticObjectId,
     datos: ParticipanteSesionUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ParticipanteSesionResponse:
-    service = ColaboracionService(db)
+    service = ColaboracionService()
     return await service.actualizar_cursor(
         sesion_id, datos, usuario_id=current_user.id
     )
@@ -192,11 +188,10 @@ async def actualizar_cursor(
     summary="Cerrar una sesión colaborativa",
 )
 async def cerrar_sesion(
-    sesion_id: int,
+    sesion_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = ColaboracionService(db)
+    service = ColaboracionService()
     await service.cerrar_sesion(sesion_id, usuario_id=current_user.id)
 
 
@@ -210,11 +205,10 @@ async def cerrar_sesion(
     ),
 )
 async def cerrar_sesiones_de_diagrama(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> dict:
-    service = ColaboracionService(db)
+    service = ColaboracionService()
     cerradas = await service.cerrar_sesiones_de_diagrama(
         diagrama_id, usuario_id=current_user.id
     )

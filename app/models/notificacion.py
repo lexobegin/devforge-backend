@@ -1,68 +1,64 @@
 # app/models/notificacion.py
 """
-Modelo ORM del módulo I. Notificaciones:
+Documentos del módulo I. Notificaciones — CICLO 2.
 
 - Notificacion → notificaciones para el usuario (alguien comentó, cambió el
-                 diagrama, terminó la generación de código, etc.).
+                 diagrama, terminó la generación de código, etc.) —
+                 colección "notificaciones".
 
 Alineado 1:1 con el script SQL (módulo I).
+
+Cambios respecto al Ciclo 1 (tabla PostgreSQL → documento MongoDB):
+- La FK id_usuario (INT) → PydanticObjectId con índice.
+- id_referencia (BIGINT polimórfico, sin FK) → Optional[str]: guarda el
+  str(id) de un Document (diagrama, trabajo de generación, comentario…) o
+  el id uuid de un elemento embebido, según `tipo`. En MongoDB no hay FKs
+  que romper: la referencia se resuelve en el servicio según el tipo.
+- La relationship usuario desaparece: se resuelve con
+  Usuario.get(self.id_usuario).
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import (
-    BigInteger,
-    Boolean,
-    DateTime,
-    ForeignKey,
-    String,
-    func,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.database import Base
+from beanie import Document, PydanticObjectId
+from pydantic import Field
 
 
-class Notificacion(Base):
-    __tablename__ = "notificaciones"
+# ======================================================================
+# Notificacion
+# ======================================================================
+class Notificacion(Document):
+    """Notificación para un usuario (colección "notificaciones")."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla notificaciones)
+    # ------------------------------------------------------------------
     # Destinatario de la notificación.
-    id_usuario: Mapped[int] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    id_usuario: PydanticObjectId
 
-    # 'COMENTARIO','CAMBIO_DIAGRAMA','GENERACION_COMPLETA', etc.
-    tipo: Mapped[str] = mapped_column(String(30), nullable=False)
+    # 'COMENTARIO', 'CAMBIO_DIAGRAMA', 'GENERACION_COMPLETA', etc.
+    tipo: str
 
-    mensaje: Mapped[str] = mapped_column(String(255), nullable=False)
+    mensaje: str
 
     # id del recurso relacionado (diagrama, comentario, trabajo_generacion…).
-    # Es polimórfica: NO lleva FK porque puede apuntar a distintas tablas
-    # según `tipo`. Se guarda como BIGINT simple.
-    id_referencia: Mapped[Optional[int]] = mapped_column(
-        BigInteger, nullable=True
-    )
+    # Es polimórfica: NO lleva FK porque puede apuntar a distintas
+    # colecciones según `tipo`. Antes BIGINT; ahora str (ObjectId o uuid).
+    id_referencia: Optional[str] = None
 
-    leida: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
+    leida: bool = False
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
     )
 
     # ------------------------------------------------------------------
-    # Relaciones
+    # Configuración del documento
     # ------------------------------------------------------------------
-    usuario: Mapped["Usuario"] = relationship(  # noqa: F821
-        "Usuario",
-        foreign_keys=[id_usuario],
-    )
+    class Settings:
+        name = "notificaciones"  # mismo nombre que la tabla del Ciclo 1
+        indexes = ["id_usuario"]
 
     # ------------------------------------------------------------------
     # Helpers

@@ -1,13 +1,13 @@
 # app/websocket/events.py
 """
-Definición de eventos del canal WebSocket de colaboración.
+Definición de eventos del canal WebSocket de colaboración — CICLO 2.
 
 Estructura de cada mensaje (JSON):
 {
     "type": "<event_type>",
     "payload": {...},
     "timestamp": "2025-01-15T10:30:00Z",   # opcional, lo agrega el servidor
-    "sender": {"id": 42, "nombre": "..."}   # opcional, lo agrega el servidor
+    "sender": {"id": "684f2c9a...", "nombre": "..."}   # opcional, lo agrega el servidor
 }
 
 Tipos de eventos soportados:
@@ -20,6 +20,14 @@ Tipos de eventos soportados:
                interface_created, interface_updated, interface_deleted
 - Sincronía:   diagram_updated, request_sync, sync_snapshot
 - Sistema:     error, ping, pong
+
+Migrado al Ciclo 2 (Beanie/MongoDB):
+- TODOS los ids del canal son STR: ObjectId en hex para usuario /
+  diagrama / sesión, y uuid hex para los elementos EMBEBIDOS del
+  Diagrama (clases, atributos, ...). El contrato de eventos (nombres de
+  eventos y forma del payload) se conserva del Ciclo 1: solo cambia el
+  tipo de los ids.
+- UserRef.id pasa de int a str (ObjectId en hex).
 """
 
 from datetime import datetime, timezone
@@ -76,7 +84,8 @@ EventType = Literal[
 class UserRef(BaseModel):
     """Referencia mínima al usuario para no enviar todo el objeto."""
 
-    id: int
+    # Ciclo 1: id int. Ciclo 2: ObjectId en hex (str).
+    id: str
     nombre: str
 
 
@@ -166,7 +175,9 @@ TIPOS_DE_CAMBIO: set[str] = {
 }
 
 
-# Mapeo: evento WS → tipo_entidad para historial_cambios_diagrama
+# Mapeo: evento WS → tipo_entidad para historial_cambios_diagrama.
+# (Ciclo 2: id_entidad es el uuid str del elemento EMBEBIDO del Diagrama;
+# los literales coinciden con el campo tipo_entidad: str de la Tanda 4.)
 EVENTO_A_ENTIDAD: dict[str, str] = {
     "class_created": "CLASE",
     "class_updated": "CLASE",
@@ -186,7 +197,9 @@ EVENTO_A_ENTIDAD: dict[str, str] = {
 }
 
 
-# Mapeo: evento WS → tipo_cambio para historial_cambios_diagrama
+# Mapeo: evento WS → tipo_cambio para historial_cambios_diagrama.
+# (Los valores coinciden con TipoCambio = Literal["CREAR","MODIFICAR",
+# "ELIMINAR"] del modelo trazabilidad de la Tanda 4.)
 EVENTO_A_CAMBIO: dict[str, str] = {
     "class_created": "CREAR",
     "class_updated": "MODIFICAR",

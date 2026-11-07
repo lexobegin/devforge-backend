@@ -1,0 +1,28 @@
+# {{ nombre_app }} — frontend generado por DevForge AI (CU24)
+
+Proyecto **React + Vite + TypeScript** generado automáticamente a partir
+del diagrama UML el {{ fecha_generacion }}.
+
+## Entidades incluidas
+
+{% for e in entidades %}
+- **{{ e.nombre }}** — tipos: `src/tipos/{{ e.recurso }}.ts` · API: `src/api/{{ e.recurso }}.ts` · listado: `src/components/{{ e.nombre }}Lista.tsx` · formulario: `src/components/{{ e.nombre }}Formulario.tsx`
+{% endfor %}
+
+Total: {{ total_entidades }} entidades.
+
+## Cómo correr
+
+1. `npm install`
+2. `npm run dev` (Vite en http://localhost:5173)
+3. Ajuste la URL del backend en `src/api/client.ts` (constante `API_BASE`,
+   por defecto `{{ api_base_url }}`).
+
+## Notas
+
+- El CRUD consume los endpoints REST de `{{ api_base_url }}` (listar,
+  obtener, crear, actualizar y eliminar por entidad).
+- Mapeo UML → TypeScript: `str→string`, `int/float→number`,
+  `bool→boolean`; cualquier otro tipo UML se degradó a `string`.
+- Este es un punto de partida: agregue ruteo, estilos y validaciones
+  según su dominio.

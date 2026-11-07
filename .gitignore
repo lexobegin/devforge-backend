@@ -1,5 +1,7 @@
 # ============================================================
-# DevForge AI — .gitignore (backend FastAPI + Python)
+# DevForge AI — .gitignore (backend FastAPI + Python) — CICLO 2
+# (Ciclo 1 → 2: fuera el bloque de temporales de Alembic;
+#  Beanie/MongoDB no usa migraciones versionadas)
 # ============================================================
 
 # --- Entornos / secretos ---
@@ -64,9 +66,6 @@ dmypy.json
 *~
 .DS_Store
 
-# --- Alembic (no versionar archivos temporales) ---
-alembic/versions/*.py.tmp
-
 # --- Salidas del motor de generación automática ---
 # Cada trabajo de generación produce una carpeta autocontenida en generated_projects/.
 # No se versionan los artefactos; solo se conservan por runtime.
@@ -85,6 +84,7 @@ logs/
 
 # --- Gunicorn / Nginx locales ---
 gunicorn.pid
+*.pid
 
 # --- OS ---
 Thumbs.db

@@ -8,11 +8,29 @@ Reglas clave:
 - No se puede duplicar un miembro en un proyecto.
 - El usuario que no pertenece al proyecto no puede verlo ni modificarlo
   (excepto ADMIN de la plataforma).
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Servicio SIN ESTADO: sin AsyncSession ni commit()/refresh(); cada
+  insert()/save()/delete() persiste de inmediato.
+- La tabla miembros_proyecto desapareció: los miembros van EMBEBIDOS en
+  Proyecto.miembros. Por eso `_require_miembro`/`_require_rol` RE-LEEN el
+  documento y devuelven el PROYECTO (no la fila del miembro): quien muta
+  membresías lo hace sobre el documento re-leído y lo guarda (regla
+  fetch → modificar → save de Beanie).
+- crear() ya no son dos INSERT dentro de una transacción: el PROPIETARIO
+  viaja embebido y basta UN insert() del documento.
+- cambiar_rol_miembro/quitar_miembro identifican al miembro por su
+  id_usuario: el embebido no tiene id propio y la clave es el par
+  (proyecto, id_usuario) que en el Ciclo 1 garantizaba uq_miembro.
+- transferir_propiedad queda en UN save() (en el Ciclo 1 eran tres UPDATE
+  + commit), y updated_at se fija aquí (el onupdate=func.now() de
+  SQLAlchemy no existe en MongoDB).
 """
 
-from typing import Optional, Sequence
+from datetime import datetime, timezone
+from typing import Sequence
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.core.exceptions import (
     ConflictError,
@@ -37,19 +55,23 @@ from app.schemas.proyecto_schema import (
 )
 
 
+def _ahora() -> datetime:
+    """Sustituye al onupdate=func.now() del Ciclo 1: marca aware UTC."""
+    return datetime.now(timezone.utc)
+
+
 class ProyectoService:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-        self.proyectos = ProyectoRepository(db)
-        self.miembros = MiembroProyectoRepository(db)
-        self.usuarios = UsuarioRepository(db)
+    def __init__(self) -> None:
+        self.proyectos = ProyectoRepository()
+        self.miembros = MiembroProyectoRepository()
+        self.usuarios = UsuarioRepository()
 
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
     async def listar_para_usuario(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         skip: int = 0,
         limit: int = 50,
@@ -77,20 +99,26 @@ class ProyectoService:
         limit: int = 50,
         incluir_archivados: bool = False,
     ) -> tuple[Sequence[ProyectoResponse], int]:
-        """Uso exclusivo del ADMIN de la plataforma."""
+        """
+        Uso exclusivo del ADMIN de la plataforma.
+        El Ciclo 1 aproximaba el total con len(items) porque el repo no
+        exponía count_all(); aquí Beanie cuenta con la MISMA condición del
+        listado (find(...).count()), así que el total es real.
+        """
         items = await self.proyectos.list_all(
             skip=skip, limit=limit, incluir_archivados=incluir_archivados
         )
-        # Nota: el repo no expone count_all() aún; usamos len() como aproximación
-        # si necesitas total real, agrega `count_all()` en ProyectoRepository.
-        total = len(items)
+        condiciones = (
+            [] if incluir_archivados else [Proyecto.estado == "ACTIVO"]
+        )
+        total = await Proyecto.find(*condiciones).count()
         return [ProyectoResponse.model_validate(p) for p in items], total
 
     async def obtener(
         self,
-        proyecto_id: int,
+        proyecto_id: PydanticObjectId,
         *,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         es_admin: bool = False,
         con_miembros: bool = False,
     ) -> ProyectoResponse | ProyectoConMiembrosResponse:
@@ -98,20 +126,17 @@ class ProyectoService:
         Obtiene un proyecto verificando que el usuario tenga acceso:
         - ADMIN: siempre.
         - No admin: debe ser miembro (cualquier rol).
+        Leer el proyecto SIEMPRE trae sus miembros embebidos, así que la
+        verificación se hace sobre el propio documento (antes
+        get_by_proyecto_usuario sobre la tabla hija).
         """
-        proyecto = await self.proyectos.get_by_id(
-            proyecto_id, con_miembros=con_miembros
-        )
+        proyecto = await self.proyectos.get_by_id(proyecto_id)
         if proyecto is None:
             raise NotFoundError("Proyecto no encontrado")
 
-        if not es_admin:
-            miembro = await self.miembros.get_by_proyecto_usuario(
-                proyecto_id, usuario_id
-            )
-            if miembro is None:
-                # 404 en vez de 403: no revelar la existencia de proyectos ajenos.
-                raise NotFoundError("Proyecto no encontrado")
+        if not es_admin and proyecto.miembro(usuario_id) is None:
+            # 404 en vez de 403: no revelar la existencia de proyectos ajenos.
+            raise NotFoundError("Proyecto no encontrado")
 
         if con_miembros:
             return ProyectoConMiembrosResponse.model_validate(proyecto)
@@ -121,30 +146,26 @@ class ProyectoService:
     # Creación
     # ------------------------------------------------------------------
     async def crear(
-        self, datos: ProyectoCreate, *, usuario_id: int
+        self, datos: ProyectoCreate, *, usuario_id: PydanticObjectId
     ) -> ProyectoResponse:
         """
-        Crea el proyecto y agrega al creador como miembro con rol PROPIETARIO,
-        todo en la misma transacción.
+        Crea el proyecto y agrega al creador como miembro con rol
+        PROPIETARIO, todo en la misma "transacción": en el Ciclo 1 eran dos
+        INSERT con commit; aquí el miembro va EMBEBIDO y basta UN insert().
         """
         proyecto = Proyecto(
             nombre=datos.nombre.strip(),
             descripcion=(datos.descripcion or "").strip() or None,
             id_propietario=usuario_id,
             estado="ACTIVO",
+            miembros=[
+                MiembroProyecto(
+                    id_usuario=usuario_id,
+                    rol_en_proyecto="PROPIETARIO",
+                )
+            ],
         )
         proyecto = await self.proyectos.create(proyecto)
-
-        # Creador = PROPIETARIO
-        miembro = MiembroProyecto(
-            id_proyecto=proyecto.id,
-            id_usuario=usuario_id,
-            rol_en_proyecto="PROPIETARIO",
-        )
-        await self.miembros.create(miembro)
-
-        await self.db.commit()
-        await self.db.refresh(proyecto)
         return ProyectoResponse.model_validate(proyecto)
 
     # ------------------------------------------------------------------
@@ -152,22 +173,19 @@ class ProyectoService:
     # ------------------------------------------------------------------
     async def actualizar(
         self,
-        proyecto_id: int,
+        proyecto_id: PydanticObjectId,
         datos: ProyectoUpdate,
         *,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
     ) -> ProyectoResponse:
         """
         Solo PROPIETARIO o EDITOR pueden modificar el proyecto.
         Cambiar el estado a ARCHIVADO solo lo puede hacer el PROPIETARIO.
         """
-        proyecto = await self.proyectos.get_by_id(proyecto_id)
-        if proyecto is None:
-            raise NotFoundError("Proyecto no encontrado")
-
-        miembro = await self._require_rol(
+        proyecto = await self._require_rol(
             proyecto_id, usuario_id, roles=("PROPIETARIO", "EDITOR")
         )
+        miembro = proyecto.miembro(usuario_id)
 
         if datos.nombre is not None:
             proyecto.nombre = datos.nombre.strip()
@@ -184,48 +202,63 @@ class ProyectoService:
                 raise ValidationError("Estado inválido")
             proyecto.estado = datos.estado
 
-        await self.proyectos.update(proyecto)
-        await self.db.commit()
-        await self.db.refresh(proyecto)
+        proyecto.updated_at = _ahora()
+        proyecto = await self.proyectos.update(proyecto)
         return ProyectoResponse.model_validate(proyecto)
 
-    async def archivar(self, proyecto_id: int, *, usuario_id: int) -> ProyectoResponse:
-        proyecto = await self.proyectos.get_by_id(proyecto_id)
-        if proyecto is None:
-            raise NotFoundError("Proyecto no encontrado")
-        await self._require_rol(proyecto_id, usuario_id, roles=("PROPIETARIO",))
-        proyecto = await self.proyectos.archivar(proyecto_id)
-        await self.db.commit()
-        await self.db.refresh(proyecto)
+    async def archivar(
+        self, proyecto_id: PydanticObjectId, *, usuario_id: PydanticObjectId
+    ) -> ProyectoResponse:
+        """
+        Ciclo 1: proyectos.archivar(proyecto_id) (UPDATE con onupdate).
+        Ciclo 2: se fija el estado y updated_at sobre el documento re-leído
+        y se guarda (fetch → modificar → save).
+        """
+        proyecto = await self._require_rol(
+            proyecto_id, usuario_id, roles=("PROPIETARIO",)
+        )
+        proyecto.estado = "ARCHIVADO"
+        proyecto.updated_at = _ahora()
+        proyecto = await self.proyectos.update(proyecto)
         return ProyectoResponse.model_validate(proyecto)
 
-    async def reactivar(self, proyecto_id: int, *, usuario_id: int) -> ProyectoResponse:
-        proyecto = await self.proyectos.get_by_id(proyecto_id)
-        if proyecto is None:
-            raise NotFoundError("Proyecto no encontrado")
-        await self._require_rol(proyecto_id, usuario_id, roles=("PROPIETARIO",))
-        proyecto = await self.proyectos.activar(proyecto_id)
-        await self.db.commit()
-        await self.db.refresh(proyecto)
+    async def reactivar(
+        self, proyecto_id: PydanticObjectId, *, usuario_id: PydanticObjectId
+    ) -> ProyectoResponse:
+        """Espejo de `archivar`: devuelve el proyecto a ACTIVO."""
+        proyecto = await self._require_rol(
+            proyecto_id, usuario_id, roles=("PROPIETARIO",)
+        )
+        proyecto.estado = "ACTIVO"
+        proyecto.updated_at = _ahora()
+        proyecto = await self.proyectos.update(proyecto)
         return ProyectoResponse.model_validate(proyecto)
 
     # ------------------------------------------------------------------
     # Eliminación
     # ------------------------------------------------------------------
-    async def eliminar(self, proyecto_id: int, *, usuario_id: int) -> None:
-        """Solo el PROPIETARIO puede eliminar el proyecto."""
-        proyecto = await self.proyectos.get_by_id(proyecto_id)
-        if proyecto is None:
-            raise NotFoundError("Proyecto no encontrado")
-        await self._require_rol(proyecto_id, usuario_id, roles=("PROPIETARIO",))
+    async def eliminar(
+        self, proyecto_id: PydanticObjectId, *, usuario_id: PydanticObjectId
+    ) -> None:
+        """
+        Solo el PROPIETARIO puede eliminar el proyecto.
+        En MongoDB no hay cascadas: las colecciones hijas (diagramas,
+        sesiones, etc.) se limpian con sus propios servicios cuando se
+        orquesta el borrado.
+        """
+        proyecto = await self._require_rol(
+            proyecto_id, usuario_id, roles=("PROPIETARIO",)
+        )
         await self.proyectos.delete(proyecto)
-        await self.db.commit()
 
     # ==================================================================
     # MIEMBROS
     # ==================================================================
     async def listar_miembros(
-        self, proyecto_id: int, *, usuario_id: int
+        self,
+        proyecto_id: PydanticObjectId,
+        *,
+        usuario_id: PydanticObjectId,
     ) -> Sequence[MiembroProyectoResponse]:
         await self._require_miembro(proyecto_id, usuario_id)
         miembros = await self.miembros.list_by_proyecto(proyecto_id)
@@ -233,20 +266,19 @@ class ProyectoService:
 
     async def agregar_miembro(
         self,
-        proyecto_id: int,
+        proyecto_id: PydanticObjectId,
         datos: MiembroProyectoCreate,
         *,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
     ) -> MiembroProyectoResponse:
         """
         Solo PROPIETARIO puede agregar miembros (según rol requerido).
-        No se puede agregar un segundo PROPIETARIO desde aquí (regla del sistema).
+        No se puede agregar un segundo PROPIETARIO desde aquí (regla del
+        sistema).
         """
-        proyecto = await self.proyectos.get_by_id(proyecto_id)
-        if proyecto is None:
-            raise NotFoundError("Proyecto no encontrado")
-
-        await self._require_rol(proyecto_id, usuario_id, roles=("PROPIETARIO",))
+        proyecto = await self._require_rol(
+            proyecto_id, usuario_id, roles=("PROPIETARIO",)
+        )
 
         # Verificar que el usuario a agregar existe
         nuevo_usuario = await self.usuarios.get_by_id(datos.id_usuario)
@@ -256,11 +288,10 @@ class ProyectoService:
         if not nuevo_usuario.activo:
             raise ValidationError("El usuario a agregar está desactivado")
 
-        # Verificar que no sea ya miembro
-        ya_miembro = await self.miembros.get_by_proyecto_usuario(
-            proyecto_id, datos.id_usuario
-        )
-        if ya_miembro is not None:
+        # Verificar que no sea ya miembro (antes get_by_proyecto_usuario
+        # sobre la tabla hija; ahora la búsqueda es sobre el embebido y
+        # equivale a la uq_miembro del Ciclo 1)
+        if proyecto.miembro(datos.id_usuario) is not None:
             raise ConflictError("El usuario ya es miembro de este proyecto")
 
         # Regla: no permitir un segundo PROPIETARIO por esta vía
@@ -270,32 +301,35 @@ class ProyectoService:
             )
 
         miembro = MiembroProyecto(
-            id_proyecto=proyecto_id,
             id_usuario=datos.id_usuario,
             rol_en_proyecto=datos.rol_en_proyecto,
         )
-        miembro = await self.miembros.create(miembro)
-        await self.db.commit()
-        await self.db.refresh(miembro)
+        miembro = await self.miembros.create(proyecto, miembro)
         return MiembroProyectoResponse.model_validate(miembro)
 
     async def cambiar_rol_miembro(
         self,
-        proyecto_id: int,
-        miembro_id: int,
+        proyecto_id: PydanticObjectId,
+        id_usuario_objetivo: PydanticObjectId,
         datos: MiembroProyectoUpdate,
         *,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
     ) -> MiembroProyectoResponse:
         """
         Solo PROPIETARIO puede cambiar roles de otros miembros.
         No se puede cambiar el rol del PROPIETARIO actual (para eso existe
         transferir_propiedad).
-        """
-        await self._require_rol(proyecto_id, usuario_id, roles=("PROPIETARIO",))
 
-        miembro = await self.miembros.get_by_id(miembro_id)
-        if miembro is None or miembro.id_proyecto != proyecto_id:
+        Ciclo 1: el router pasaba `miembro_id` (id de la fila en
+        miembros_proyecto). Ciclo 2: el embebido no tiene id propio, así
+        que el miembro se identifica por su id_usuario.
+        """
+        proyecto = await self._require_rol(
+            proyecto_id, usuario_id, roles=("PROPIETARIO",)
+        )
+
+        miembro = proyecto.miembro(id_usuario_objetivo)
+        if miembro is None:
             raise NotFoundError("Miembro no encontrado en este proyecto")
 
         if miembro.rol_en_proyecto == "PROPIETARIO":
@@ -310,26 +344,31 @@ class ProyectoService:
             )
 
         miembro.rol_en_proyecto = datos.rol_en_proyecto
-        await self.miembros.update(miembro)
-        await self.db.commit()
-        await self.db.refresh(miembro)
+        await self.miembros.update(proyecto, miembro)
         return MiembroProyectoResponse.model_validate(miembro)
 
     async def quitar_miembro(
         self,
-        proyecto_id: int,
-        miembro_id: int,
+        proyecto_id: PydanticObjectId,
+        id_usuario_objetivo: PydanticObjectId,
         *,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
     ) -> None:
         """
         Solo PROPIETARIO puede quitar miembros.
         No se puede quitar al PROPIETARIO (debe transferir primero o eliminar
         el proyecto completo).
         Un miembro también puede quitarse a sí mismo (salirse del proyecto).
+
+        Ciclo 1: el router pasaba `miembro_id` de la fila; Ciclo 2: el
+        miembro se identifica por su id_usuario (ver cambiar_rol_miembro).
         """
-        miembro = await self.miembros.get_by_id(miembro_id)
-        if miembro is None or miembro.id_proyecto != proyecto_id:
+        proyecto = await self.proyectos.get_by_id(proyecto_id)
+        if proyecto is None:
+            raise NotFoundError("Proyecto no encontrado")
+
+        miembro = proyecto.miembro(id_usuario_objetivo)
+        if miembro is None:
             raise NotFoundError("Miembro no encontrado en este proyecto")
 
         if miembro.rol_en_proyecto == "PROPIETARIO":
@@ -340,17 +379,19 @@ class ProyectoService:
         # El propio miembro puede salirse sin ser PROPIETARIO
         es_el_mismo = miembro.id_usuario == usuario_id
         if not es_el_mismo:
-            await self._require_rol(proyecto_id, usuario_id, roles=("PROPIETARIO",))
+            # Re-lectura fresca para mutar con la regla de Beanie
+            proyecto = await self._require_rol(
+                proyecto_id, usuario_id, roles=("PROPIETARIO",)
+            )
 
-        await self.miembros.delete(miembro)
-        await self.db.commit()
+        await self.miembros.delete(proyecto, miembro)
 
     async def transferir_propiedad(
         self,
-        proyecto_id: int,
-        nuevo_propietario_id: int,
+        proyecto_id: PydanticObjectId,
+        nuevo_propietario_id: PydanticObjectId,
         *,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
     ) -> MiembroProyectoResponse:
         """
         Transfiere el rol PROPIETARIO del proyecto actual a otro miembro.
@@ -360,58 +401,68 @@ class ProyectoService:
         """
         await self._require_rol(proyecto_id, usuario_id, roles=("PROPIETARIO",))
 
-        # Actual = usuario_id
-        actual = await self.miembros.get_by_proyecto_usuario(proyecto_id, usuario_id)
-        nuevo = await self.miembros.get_by_proyecto_usuario(
-            proyecto_id, nuevo_propietario_id
-        )
+        # Re-lectura fresca del documento para mutarlo (regla de Beanie)
+        proyecto = await self.proyectos.get_by_id(proyecto_id)
+        actual = proyecto.miembro(usuario_id)
+        nuevo = proyecto.miembro(nuevo_propietario_id)
         if nuevo is None:
             raise NotFoundError(
                 "El nuevo propietario debe ser miembro del proyecto"
             )
-        if actual.id == nuevo.id:
+        # Ciclo 1: actual.id == nuevo.id (ids de fila). Ciclo 2: la membresía
+        # es única por usuario, basta comparar el id_usuario.
+        if actual.id_usuario == nuevo.id_usuario:
             raise ValidationError("El usuario ya es propietario del proyecto")
 
         # Intercambio de roles
         actual.rol_en_proyecto = "EDITOR"
         nuevo.rol_en_proyecto = "PROPIETARIO"
 
-        # Actualizar también el id_propietario en la tabla proyectos
-        proyecto = await self.proyectos.get_by_id(proyecto_id)
+        # Actualizar también el id_propietario en la "tabla" proyectos
         proyecto.id_propietario = nuevo_propietario_id
+        proyecto.updated_at = _ahora()
 
-        await self.miembros.update(actual)
-        await self.miembros.update(nuevo)
-        await self.proyectos.update(proyecto)
-        await self.db.commit()
-        await self.db.refresh(nuevo)
+        # Ciclo 1: tres UPDATE + commit. Ciclo 2: un solo save() del documento.
+        proyecto = await self.proyectos.update(proyecto)
         return MiembroProyectoResponse.model_validate(nuevo)
 
     # ==================================================================
     # Helpers internos
     # ==================================================================
     async def _require_miembro(
-        self, proyecto_id: int, usuario_id: int
-    ) -> MiembroProyecto:
-        """Verifica que el usuario sea miembro del proyecto (cualquier rol)."""
-        miembro = await self.miembros.get_by_proyecto_usuario(proyecto_id, usuario_id)
-        if miembro is None:
+        self,
+        proyecto_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
+    ) -> Proyecto:
+        """
+        Verifica que el usuario sea miembro del proyecto (cualquier rol).
+
+        Ciclo 1: devolvía la fila de miembros_proyecto. Ciclo 2: devuelve el
+        DOCUMENTO Proyecto re-leído de la base (los miembros van embebidos y
+        las mutaciones se hacen sobre él, regla fetch → modificar → save).
+        """
+        proyecto = await self.proyectos.get_by_id(proyecto_id)
+        if proyecto is None:
+            # 404 en vez de 403: no revelar la existencia de proyectos ajenos.
             raise NotFoundError("Proyecto no encontrado")
-        return miembro
+
+        if proyecto.miembro(usuario_id) is None:
+            raise NotFoundError("Proyecto no encontrado")
+
+        return proyecto
 
     async def _require_rol(
         self,
-        proyecto_id: int,
-        usuario_id: int,
+        proyecto_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
         *,
         roles: tuple[str, ...],
-    ) -> MiembroProyecto:
+    ) -> Proyecto:
         """Verifica que el usuario tenga uno de los roles indicados."""
-        miembro = await self.miembros.get_by_proyecto_usuario(proyecto_id, usuario_id)
-        if miembro is None:
-            raise NotFoundError("Proyecto no encontrado")
+        proyecto = await self._require_miembro(proyecto_id, usuario_id)
+        miembro = proyecto.miembro(usuario_id)
         if miembro.rol_en_proyecto not in roles:
             raise ForbiddenError(
                 f"Se requiere rol {' o '.join(roles)} en el proyecto"
             )
-        return miembro
+        return proyecto

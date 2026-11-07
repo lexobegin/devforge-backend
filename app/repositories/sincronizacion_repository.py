@@ -1,33 +1,50 @@
 # app/repositories/sincronizacion_repository.py
 """
-Repositorio de acceso a datos del módulo H. Sincronización Móvil/Web Offline:
+Repositorio de acceso a datos del módulo H. Sincronización Móvil/Web
+Offline — CICLO 2.
 
-- ColaSincronizacionRepository → tabla `cola_sincronizacion_movil`
+- ColaSincronizacionRepository → colección `cola_sincronizacion_movil`
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Ya no recibe AsyncSession: repositorio SIN ESTADO (la conexión la lleva
+  Beanie tras app/mongo.init_db()).
+- ids int → PydanticObjectId (ObjectId de Mongo); id_dispositivo e
+  id_temporal_local siguen siendo str (los genera el cliente).
+- flush/refresh → insert()/save()/delete() de Beanie.
+- bulk_create hace un bucle de insert(): Mongo no devuelve filas que
+  haya que "refrescar" como el add_all + refresh del Ciclo 1; cada
+  insert() asigna el ObjectId de su ítem.
+- delete_sincronizados_by_dispositivo usa UN delete con filtro (el
+  rowcount del Ciclo 1 es el deleted_count de Mongo).
+- Conexión con el módulo G: tipo_operacion es el MISMO vocabulario de
+  tipo_accion de la IA, así que el ejecutor de servicios procesa un
+  cambio offline igual que una acción del Agente Dev.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Sequence
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.models.sincronizacion import ColaSincronizacionMovil
 
 
-class ColaSincronizacionRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
+def _ahora(cuando: Optional[datetime] = None) -> datetime:
+    """Fecha de trabajo aware; permite inyectar `cuando` en tests."""
+    return cuando or datetime.now(timezone.utc)
 
+
+# ======================================================================
+# ColaSincronizacionRepository
+# ======================================================================
+class ColaSincronizacionRepository:
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
-    async def get_by_id(self, item_id: int) -> Optional[ColaSincronizacionMovil]:
-        result = await self.db.execute(
-            select(ColaSincronizacionMovil).where(
-                ColaSincronizacionMovil.id == item_id
-            )
-        )
-        return result.scalar_one_or_none()
+    async def get_by_id(
+        self, item_id: PydanticObjectId
+    ) -> Optional[ColaSincronizacionMovil]:
+        return await ColaSincronizacionMovil.get(item_id)
 
     async def get_by_dispositivo_y_temporal(
         self, id_dispositivo: str, id_temporal_local: str
@@ -37,98 +54,88 @@ class ColaSincronizacionRepository:
         Sirve para hacer idempotente el reenvío de un mismo cambio
         (si el cliente reintenta, no se duplica).
         """
-        result = await self.db.execute(
-            select(ColaSincronizacionMovil).where(
-                ColaSincronizacionMovil.id_dispositivo == id_dispositivo,
-                ColaSincronizacionMovil.id_temporal_local == id_temporal_local,
-            )
+        return await ColaSincronizacionMovil.find_one(
+            ColaSincronizacionMovil.id_dispositivo == id_dispositivo,
+            ColaSincronizacionMovil.id_temporal_local == id_temporal_local,
         )
-        return result.scalar_one_or_none()
 
     async def list_pendientes_by_dispositivo(
         self, id_dispositivo: str
     ) -> Sequence[ColaSincronizacionMovil]:
-        """Todos los ítems PENDIENTES de un dispositivo, en orden de llegada."""
-        result = await self.db.execute(
-            select(ColaSincronizacionMovil)
-            .where(
+        """Todos los ítems PENDIENTES de un dispositivo, en orden de
+        llegada."""
+        return await (
+            ColaSincronizacionMovil.find(
                 ColaSincronizacionMovil.id_dispositivo == id_dispositivo,
                 ColaSincronizacionMovil.estado == "PENDIENTE",
             )
-            .order_by(ColaSincronizacionMovil.created_at.asc())
+            .sort(+ColaSincronizacionMovil.created_at)
+            .to_list()
         )
-        return result.scalars().all()
 
     async def list_by_diagrama(
         self,
-        diagrama_id: int,
+        diagrama_id: PydanticObjectId,
         *,
         estado: Optional[str] = None,
         skip: int = 0,
         limit: int = 100,
     ) -> Sequence[ColaSincronizacionMovil]:
-        stmt = (
-            select(ColaSincronizacionMovil)
-            .where(ColaSincronizacionMovil.id_diagrama == diagrama_id)
-            .order_by(ColaSincronizacionMovil.created_at.asc())
-            .offset(skip)
-            .limit(limit)
-        )
+        condiciones = [ColaSincronizacionMovil.id_diagrama == diagrama_id]
         if estado is not None:
-            stmt = stmt.where(ColaSincronizacionMovil.estado == estado)
-        result = await self.db.execute(stmt)
-        return result.scalars().all()
+            condiciones.append(ColaSincronizacionMovil.estado == estado)
+        return await (
+            ColaSincronizacionMovil.find(*condiciones)
+            .sort(+ColaSincronizacionMovil.created_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
+        )
 
     async def list_by_usuario(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         estado: Optional[str] = None,
         skip: int = 0,
         limit: int = 100,
     ) -> Sequence[ColaSincronizacionMovil]:
-        stmt = (
-            select(ColaSincronizacionMovil)
-            .where(ColaSincronizacionMovil.id_usuario == usuario_id)
-            .order_by(ColaSincronizacionMovil.created_at.desc())
-            .offset(skip)
-            .limit(limit)
-        )
+        condiciones = [ColaSincronizacionMovil.id_usuario == usuario_id]
         if estado is not None:
-            stmt = stmt.where(ColaSincronizacionMovil.estado == estado)
-        result = await self.db.execute(stmt)
-        return result.scalars().all()
+            condiciones.append(ColaSincronizacionMovil.estado == estado)
+        return await (
+            ColaSincronizacionMovil.find(*condiciones)
+            .sort(-ColaSincronizacionMovil.created_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
+        )
 
     async def list_conflictos_by_diagrama(
-        self, diagrama_id: int
+        self, diagrama_id: PydanticObjectId
     ) -> Sequence[ColaSincronizacionMovil]:
         """Ítems con estado CONFLICTO, pendientes de resolución manual."""
-        result = await self.db.execute(
-            select(ColaSincronizacionMovil)
-            .where(
+        return await (
+            ColaSincronizacionMovil.find(
                 ColaSincronizacionMovil.id_diagrama == diagrama_id,
                 ColaSincronizacionMovil.estado == "CONFLICTO",
             )
-            .order_by(ColaSincronizacionMovil.created_at.asc())
+            .sort(+ColaSincronizacionMovil.created_at)
+            .to_list()
         )
-        return result.scalars().all()
 
     async def count_by_estado(self, estado: str) -> int:
-        result = await self.db.execute(
-            select(func.count(ColaSincronizacionMovil.id)).where(
-                ColaSincronizacionMovil.estado == estado
-            )
-        )
-        return int(result.scalar_one())
+        return await ColaSincronizacionMovil.find(
+            ColaSincronizacionMovil.estado == estado
+        ).count()
 
-    async def count_pendientes_by_dispositivo(self, id_dispositivo: str) -> int:
-        result = await self.db.execute(
-            select(func.count(ColaSincronizacionMovil.id)).where(
-                ColaSincronizacionMovil.id_dispositivo == id_dispositivo,
-                ColaSincronizacionMovil.estado == "PENDIENTE",
-            )
-        )
-        return int(result.scalar_one())
+    async def count_pendientes_by_dispositivo(
+        self, id_dispositivo: str
+    ) -> int:
+        return await ColaSincronizacionMovil.find(
+            ColaSincronizacionMovil.id_dispositivo == id_dispositivo,
+            ColaSincronizacionMovil.estado == "PENDIENTE",
+        ).count()
 
     # ------------------------------------------------------------------
     # Escrituras
@@ -136,31 +143,28 @@ class ColaSincronizacionRepository:
     async def create(
         self, item: ColaSincronizacionMovil
     ) -> ColaSincronizacionMovil:
-        self.db.add(item)
-        await self.db.flush()
-        await self.db.refresh(item)
+        await item.insert()
         return item
 
     async def bulk_create(
         self, items: list[ColaSincronizacionMovil]
     ) -> list[ColaSincronizacionMovil]:
-        """Registra un batch completo de cambios offline de una sola vez."""
-        self.db.add_all(items)
-        await self.db.flush()
-        for i in items:
-            await self.db.refresh(i)
+        """Registra un batch completo de cambios offline de una sola vez.
+        (Cada insert() asigna el ObjectId de su ítem: el bucle sustituye
+        al add_all + refresh del Ciclo 1.)"""
+        for item in items:
+            await item.insert()
         return items
 
     async def update(
         self, item: ColaSincronizacionMovil
     ) -> ColaSincronizacionMovil:
-        await self.db.flush()
-        await self.db.refresh(item)
+        await item.save()
         return item
 
     async def marcar_sincronizado(
         self,
-        item_id: int,
+        item_id: PydanticObjectId,
         *,
         cuando: Optional[datetime] = None,
     ) -> Optional[ColaSincronizacionMovil]:
@@ -168,40 +172,34 @@ class ColaSincronizacionRepository:
         if item is None:
             return None
         item.estado = "SINCRONIZADO"
-        item.synced_at = cuando or datetime.utcnow()
-        await self.db.flush()
-        await self.db.refresh(item)
+        item.synced_at = _ahora(cuando)
+        await item.save()
         return item
 
     async def marcar_conflicto(
-        self, item_id: int
+        self, item_id: PydanticObjectId
     ) -> Optional[ColaSincronizacionMovil]:
         item = await self.get_by_id(item_id)
         if item is None:
             return None
         item.estado = "CONFLICTO"
-        await self.db.flush()
-        await self.db.refresh(item)
+        await item.save()
         return item
 
     async def delete(self, item: ColaSincronizacionMovil) -> None:
-        await self.db.delete(item)
-        await self.db.flush()
+        await item.delete()
 
     async def delete_sincronizados_by_dispositivo(
         self, id_dispositivo: str
     ) -> int:
         """
-        Housekeeping: elimina los ítems ya SINCRONIZADOS de un dispositivo.
-        Se puede invocar periódicamente para no acumular filas.
+        Housekeeping: elimina los ítems ya SINCRONIZADOS de un
+        dispositivo. Se puede invocar periódicamente para no acumular
+        documentos. Devuelve cuántos borró (el rowcount del Ciclo 1 es
+        el deleted_count de Mongo).
         """
-        from sqlalchemy import delete as sa_delete
-
-        result = await self.db.execute(
-            sa_delete(ColaSincronizacionMovil).where(
-                ColaSincronizacionMovil.id_dispositivo == id_dispositivo,
-                ColaSincronizacionMovil.estado == "SINCRONIZADO",
-            )
-        )
-        await self.db.flush()
-        return int(result.rowcount or 0)
+        resultado = await ColaSincronizacionMovil.find(
+            ColaSincronizacionMovil.id_dispositivo == id_dispositivo,
+            ColaSincronizacionMovil.estado == "SINCRONIZADO",
+        ).delete()
+        return int(getattr(resultado, "deleted_count", 0) or 0)

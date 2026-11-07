@@ -1,6 +1,6 @@
 # app/api/v1/usuarios_router.py
 """
-Endpoints de gestión de usuarios (módulo A. Usuarios y Seguridad):
+Endpoints de gestión de usuarios (módulo A. Usuarios y Seguridad) — CICLO 2.
 
 - GET    /api/v1/usuarios              → listar (solo ADMIN)
 - POST   /api/v1/usuarios              → crear (solo ADMIN)
@@ -14,13 +14,17 @@ Reglas aplicadas desde el servicio:
 - Un usuario normal solo puede editar su propio perfil y NO puede cambiar
   `rol` ni `activo`.
 - Un ADMIN no puede desactivarse ni eliminarse a sí mismo.
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession; ids de ruta
+PydanticObjectId; la defensa 403 del GET usa ForbiddenError (el manejador
+de app/core/exceptions.py la traduce con el mismo JSON uniforme).
 """
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_current_active_user, require_admin
-from app.database import get_db
+from app.core.exceptions import ForbiddenError
 from app.models.usuario import Usuario
 from app.schemas.usuario_schema import (
     UsuarioCreate,
@@ -46,9 +50,8 @@ async def listar_usuarios(
     limit: int = Query(50, ge=1, le=200, description="Máx. registros por página"),
     solo_activos: bool = Query(False, description="Filtrar solo usuarios activos"),
     _admin: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ) -> dict:
-    service = UsuarioService(db)
+    service = UsuarioService()
     items, total = await service.listar(
         skip=skip, limit=limit, solo_activos=solo_activos
     )
@@ -73,9 +76,8 @@ async def listar_usuarios(
 async def crear_usuario(
     datos: UsuarioCreate,
     _admin: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ) -> UsuarioResponse:
-    service = UsuarioService(db)
+    service = UsuarioService()
     return await service.crear(datos)
 
 
@@ -92,20 +94,14 @@ async def crear_usuario(
     ),
 )
 async def obtener_usuario(
-    usuario_id: int,
+    usuario_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> UsuarioResponse:
     # Defensa previa a nivel router: si no es admin ni es él mismo → 403
     if not current_user.is_admin and current_user.id != usuario_id:
-        from fastapi import HTTPException
+        raise ForbiddenError("No puede consultar el perfil de otro usuario")
 
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No puede consultar el perfil de otro usuario",
-        )
-
-    service = UsuarioService(db)
+    service = UsuarioService()
     return await service.obtener(usuario_id)
 
 
@@ -123,12 +119,11 @@ async def obtener_usuario(
     ),
 )
 async def actualizar_usuario(
-    usuario_id: int,
+    usuario_id: PydanticObjectId,
     datos: UsuarioUpdate,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> UsuarioResponse:
-    service = UsuarioService(db)
+    service = UsuarioService()
     return await service.actualizar(
         usuario_id,
         datos,
@@ -146,11 +141,10 @@ async def actualizar_usuario(
     summary="Activar usuario (solo ADMIN)",
 )
 async def activar_usuario(
-    usuario_id: int,
+    usuario_id: PydanticObjectId,
     _admin: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ) -> UsuarioResponse:
-    service = UsuarioService(db)
+    service = UsuarioService()
     return await service.activar(usuario_id)
 
 
@@ -164,11 +158,10 @@ async def activar_usuario(
     description="Soft-disable: no borra datos, solo marca `activo=False`.",
 )
 async def desactivar_usuario(
-    usuario_id: int,
+    usuario_id: PydanticObjectId,
     current_user: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ) -> UsuarioResponse:
-    service = UsuarioService(db)
+    service = UsuarioService()
     return await service.desactivar(
         usuario_id, current_user_id=current_user.id
     )
@@ -182,15 +175,14 @@ async def desactivar_usuario(
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Eliminar usuario (solo ADMIN)",
     description=(
-        "Eliminación física. Uso excepcional: puede fallar si el usuario "
-        "tiene FKs con ondelete=RESTRICT (proyectos, diagramas, etc.). "
-        "En operación normal use `desactivar`."
+        "Eliminación física. Uso excepcional: puede fallar si quedan "
+        "referencias (proyectos, diagramas…). En operación normal use "
+        "`desactivar`."
     ),
 )
 async def eliminar_usuario(
-    usuario_id: int,
+    usuario_id: PydanticObjectId,
     _admin: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = UsuarioService(db)
+    service = UsuarioService()
     await service.eliminar(usuario_id)

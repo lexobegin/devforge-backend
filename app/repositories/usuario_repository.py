@@ -3,37 +3,54 @@
 Repositorio de acceso a datos para el módulo A. Usuarios y Seguridad.
 
 No contiene lógica de negocio (eso es `services/auth_service.py`).
-Solo operaciones atómicas sobre la tabla `usuarios`.
+Solo operaciones atómicas sobre la COLECCIÓN `usuarios`.
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Ya no recibe AsyncSession: Beanie se inicializa UNA sola vez
+  (app/mongo.init_db) y los documentos llevan la conexión. Los
+  repositorios quedan SIN ESTADO (los services pueden instanciarlos una
+  única vez y reutilizarlos).
+- get_by_id recibe PydanticObjectId (ObjectId de Mongo), no int.
+- La búsqueda case-insensitive por email (func.lower de SQL) se resuelve
+  con una expresión regular anclada con $options:"i": mismo resultado sin
+  depender de cómo se guardó el email.
+- create/update/delete ya no hacen flush/refresh: insert()/save()/delete()
+  de Beanie escriben en Mongo y dejan el documento en memoria actualizado.
 """
 
+import re
 from typing import Optional, Sequence
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.models.usuario import Usuario
 
 
-class UsuarioRepository:
-    """Operaciones CRUD y consultas sobre `usuarios`."""
+def _regex_exacto(texto: str) -> str:
+    """
+    Expresión regular que coincide EXACTAMENTE con `texto` sin distinguir
+    mayúsculas/minúsculas (equivale a func.lower(email) == email.lower()
+    del Ciclo 1). El texto se escapa para que el punto del email (y
+    cualquier otro carácter especial) no se interprete como patrón.
+    """
+    return f"^{re.escape(texto)}$"
 
-    def __init__(self, db: AsyncSession):
-        self.db = db
+
+class UsuarioRepository:
+    """Operaciones CRUD y consultas sobre la colección `usuarios`."""
 
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
-    async def get_by_id(self, usuario_id: int) -> Optional[Usuario]:
-        result = await self.db.execute(
-            select(Usuario).where(Usuario.id == usuario_id)
-        )
-        return result.scalar_one_or_none()
+    async def get_by_id(
+        self, usuario_id: PydanticObjectId
+    ) -> Optional[Usuario]:
+        return await Usuario.get(usuario_id)
 
     async def get_by_email(self, email: str) -> Optional[Usuario]:
-        result = await self.db.execute(
-            select(Usuario).where(func.lower(Usuario.email) == email.lower())
+        return await Usuario.find_one(
+            {"email": {"$regex": _regex_exacto(email), "$options": "i"}}
         )
-        return result.scalar_one_or_none()
 
     async def list_all(
         self,
@@ -42,50 +59,59 @@ class UsuarioRepository:
         limit: int = 50,
         solo_activos: bool = False,
     ) -> Sequence[Usuario]:
-        stmt = select(Usuario).order_by(Usuario.created_at.desc())
-        if solo_activos:
-            stmt = stmt.where(Usuario.activo.is_(True))
-        stmt = stmt.offset(skip).limit(limit)
-        result = await self.db.execute(stmt)
-        return result.scalars().all()
+        consulta = (
+            Usuario.find(Usuario.activo == True)  # noqa: E712
+            if solo_activos
+            else Usuario.find_all()
+        )
+        return await (
+            consulta.sort(-Usuario.created_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
+        )
 
     async def count(self, *, solo_activos: bool = False) -> int:
-        stmt = select(func.count(Usuario.id))
-        if solo_activos:
-            stmt = stmt.where(Usuario.activo.is_(True))
-        result = await self.db.execute(stmt)
-        return int(result.scalar_one())
+        consulta = (
+            Usuario.find(Usuario.activo == True)  # noqa: E712
+            if solo_activos
+            else Usuario.find_all()
+        )
+        return await consulta.count()
 
-    async def email_exists(self, email: str, *, exclude_id: Optional[int] = None) -> bool:
-        stmt = select(Usuario.id).where(func.lower(Usuario.email) == email.lower())
+    async def email_exists(
+        self,
+        email: str,
+        *,
+        exclude_id: Optional[PydanticObjectId] = None,
+    ) -> bool:
+        filtro: dict = {
+            "email": {"$regex": _regex_exacto(email), "$options": "i"}
+        }
         if exclude_id is not None:
-            stmt = stmt.where(Usuario.id != exclude_id)
-        result = await self.db.execute(stmt.limit(1))
-        return result.scalar_one_or_none() is not None
+            filtro["_id"] = {"$ne": exclude_id}
+        return await Usuario.find_one(filtro) is not None
 
     # ------------------------------------------------------------------
     # Escrituras
     # ------------------------------------------------------------------
     async def create(self, usuario: Usuario) -> Usuario:
-        self.db.add(usuario)
-        await self.db.flush()   # asigna id sin cerrar la transacción
-        await self.db.refresh(usuario)
+        await usuario.insert()   # asigna el ObjectId y persiste
         return usuario
 
     async def update(self, usuario: Usuario) -> Usuario:
-        await self.db.flush()
-        await self.db.refresh(usuario)
+        await usuario.save()
         return usuario
 
     async def delete(self, usuario: Usuario) -> None:
-        await self.db.delete(usuario)
-        await self.db.flush()
+        await usuario.delete()
 
-    async def set_activo(self, usuario_id: int, activo: bool) -> Optional[Usuario]:
+    async def set_activo(
+        self, usuario_id: PydanticObjectId, activo: bool
+    ) -> Optional[Usuario]:
         usuario = await self.get_by_id(usuario_id)
         if usuario is None:
             return None
         usuario.activo = activo
-        await self.db.flush()
-        await self.db.refresh(usuario)
+        await usuario.save()
         return usuario

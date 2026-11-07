@@ -1,27 +1,97 @@
 # app/utils/xmi_converter.py
 """
-Conversión entre diagrama de clases (ORM) y XMI/XML.
+Conversión entre diagrama de clases y XMI/XML — CICLO 2.
 
-Soporta DOS formatos de importación:
+Soporta DOS formatos:
 
 1. **Formato DevForge AI** (round-trip propio):
    - Usa namespaces XMI 2.5/UML 2.5 estándar.
-   - `<Class>`, `<Attribute>`, `<Operation>`, `<Association>`.
+   - `<Class>`, `<Attribute>`, `<Operation>`, `<Parameter>`, `<Interface>`.
+   - Relaciones como elemento con el tag de su tipo (`<Association>`,
+     `<Aggregation>`, `<Composition>`, `<Dependency>`,
+     `<Generalization>`, `<InterfaceRealization>`) y source/target.
    - Tipos como atributo `type="String"`.
 
 2. **Formato Enterprise Architect** (XMI 1.1 / UML 1.3):
    - `<XMI>` con `<UML:Model>` dentro de `<XMI.content>`.
    - Clases en `<UML:Namespace.ownedElement>` dentro de `<UML:Package>`.
-   - Atributos en `<UML:Classifier.feature>`.
-   - Tipos vía `<UML:TaggedValue tag="type" value="char">`.
-   - Relaciones vía `<UML:Association>` con `<UML:Association.connection>`.
+   - Atributos/operaciones en `<UML:Classifier.feature>`.
+   - Tipos vía `<UML:TaggedValue tag="type" value="char">` o por
+     `xmi.idref` contra los `<UML:DataType>` declarados.
+   - Relaciones vía `<UML:Association>` con `<UML:Association.connection>`
+     (el atributo `aggregation="composite|aggregate"` de los extremos
+     distingue composición/agregación) y `<UML:Generalization>` con
+     child/parent. Las Association Classes de EA (M:N con clase
+     intermedia) se convierten en DOS relaciones 1:N intermediadas.
    - Posiciones en `<UML:DiagramElement geometry="Left=..;Top=..">`.
 
-La exportación siempre se hace en el formato DevForge AI (`diagrama_a_xmi`).
-La importación detecta automáticamente el formato (`xmi_a_estructura`).
+La exportación (`diagrama_a_xmi`) sale en formato DevForge AI por
+defecto; con formato="ea" se genera XMI 1.1/UML 1.3 que Enterprise
+Architect puede abrir y que DevForge reimporta sin pérdidas.
+La importación (`xmi_a_estructura`) detecta el formato automáticamente
+y lanza `BadRequestError` si el XML es inválido o desconocido.
+
+Cambios de la reconversión Ciclo 1 → Ciclo 2 (Tanda 19c):
+
+- Módulo PURO (sin imports de Beanie/SQLAlchemy): el Diagrama llega
+  duck-typed (getattr) con sus embebidos ClaseUML/AtributoUML/
+  OperacionUML/ParametroOperacionUML/InterfazUML/OperacionInterfazUML/
+  RelacionUML, así que sigue testeable sin base de datos (misma política
+  que mapping_engine y postman_export en la Tanda 18).
+- IDS: el Diagrama pasa de int a PydanticObjectId (str() explícito en
+  los atributos XML) y los elementos embebidos usan ids uuid hex
+  generados en la aplicación (en el Ciclo 1 eran ints de fila). Los
+  xmi:id quedan "clase_<uuid>", "attr_<uuid>", "op_<uuid>", "rel_<uuid>";
+  como el parser DevForge resuelve source/target vía id→nombre, el
+  cambio es transparente para el round-trip.
+- datetime.utcnow() (deprecado en Python 3.12) → datetime.now(timezone.utc)
+  con los MISMOS formatos de timestamp de salida.
+- BUG de detección corregido: el chequeo del formato DevForge (raíz
+  <xmi:XMI> con el namespace OMG) va PRIMERO. En el Ciclo 1 quedaba
+  DESPUÉS del chequeo EA y, como la raíz DevForge también tiene
+  localname "XMI" y un <Model> dentro, caía en la rama de EA: el
+  round-trip DevForge→DevForge se parseaba con clases vacías (el parser
+  EA busca Classifier.feature, que el exportador DevForge no escribe).
+  Cazado por el arnés de esta tanda.
+- FIDELIDAD del exportador EA (el del Ciclo 1 solo escribía clases con
+  atributos y asociaciones; reimportar perdía operaciones, interfaces,
+  herencias, roles, valores por defecto y estáticos):
+  * escribe <UML:Operation> (con <UML:Parameter> tipado) y
+    <UML:Interface> (con sus operaciones y posición en el diagrama);
+  * las GENERALIZACIONES viajan como <UML:Generalization child/parent>;
+  * DEPENDENCIA y REALIZACION viajan como <UML:Association> + un
+    TaggedValue "tipo_relacion" que el importador lee con prioridad
+    sobre el atributo aggregation de los extremos (EA ignora los
+    tagged values desconocidos: sigue siendo XMI 1.1 válido);
+  * es_aspecto estático viaja en ownerScope="classifier" (y el
+    importador ya lo lee), el valor por defecto en un TaggedValue
+    "defaultValue", el estereotipo en un TaggedValue "stereotype", el
+    nombre de la asociación en un TaggedValue "name" y los roles en el
+    atributo name de cada AssociationEnd (convención UML 1.3).
+- Fix del importador EA: el tipo de retorno de las operaciones de
+  interfaz ya no es "void" fijo: se lee el TaggedValue del tipo y se
+  normaliza al vocabulario DevForge (misma regla que las operaciones
+  de clase).
+- Código muerto eliminado del original: diagrama_a_xmiiii (duplicado
+  con typo de _diagrama_a_xmi_devforge), el bloque _TIPOS_EA_A_DEVFORE
+  comentado, el "Paso 4" comentado del parser EA y su primera pasada
+  association_class_ids/associations_por_id (nadie consultaba esos
+  acumuladores: la segunda pasada usa _extraer_association_class_id
+  elemento a elemento). Typo interno corregido: _DEVFORE_A_EA →
+  _DEVFORGE_A_EA (y _TIPOS_EA_A_DEVFORE → _TIPOS_EA_A_DEVFORGE).
+- El CONTRATO con IntercambioService NO cambia: xmi_a_estructura
+  devuelve {"clases": [...], "interfaces": [...], "relaciones": [...]}
+  con exactamente las claves que consume
+  _aplicar_estructura_a_diagrama (nombre/es_abstracta/estereotipo/
+  pos_x/pos_y/atributos/operaciones; origen/destino/tipo/
+  multiplicidad_origen/multiplicidad_destino/nombre_asociacion/
+  rol_origen/rol_destino).
+- app/utils/__init__.py (Tanda 18) sigue sin exportar este módulo: el
+  servicio lo importa por ruta completa (lazy) y el arnés de la Tanda
+  13 mantiene su stub deliberado en sys.modules.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
 
@@ -36,6 +106,18 @@ UML_NS = "http://www.omg.org/spec/UML/20131001"
 ET.register_namespace("xmi", XMI_NS)
 ET.register_namespace("uml", UML_NS)
 
+
+# Tipos de relación válidos en el vocabulario DevForge (los 6 del
+# modelo; se usa para aceptar el TaggedValue "tipo_relacion" del XMI
+# sin importar app.models — este módulo es puro).
+_TIPOS_RELACION = (
+    "ASOCIACION",
+    "AGREGACION",
+    "COMPOSICION",
+    "DEPENDENCIA",
+    "GENERALIZACION",
+    "REALIZACION",
+)
 
 # Mapeo tipo_relacion (BD) → tag XMI/UML
 _TIPO_A_TAG = {
@@ -57,45 +139,9 @@ _TAG_A_TIPO = {
     "InterfaceRealization": "REALIZACION",
 }
 
-# Normalización de tipos UML 1.3 (EA) → tipos canónicos usados por DevForge
-# Nota: los tipos Java primitivos (char, int, double) se mapean a sus
-# equivalentes en el vocabulario de DevForge (String, Integer, Float).
-#_TIPOS_EA_A_DEVFORE = {
-#    "char": "String",
-#    "varchar": "String",
-#    "string": "String",
-#    "String": "String",
-#    "int": "Integer",
-#    "integer": "Integer",
-#    "Integer": "Integer",
-#    "long": "Long",
-#    "Long": "Long",
-#    "float": "Float",
-#    "Float": "Float",
-#    "double": "Double",
-#    "Double": "Double",
-#    "decimal": "BigDecimal",
-#    "BigDecimal": "BigDecimal",
-#    "boolean": "Boolean",
-#    "Boolean": "Boolean",
-#    "bool": "Boolean",
-#    "date": "Date",
-#    "Date": "Date",
-#    "datetime": "DateTime",
-#    "DateTime": "DateTime",
-#    "time": "Time",
-#    "Time": "Time",
-#    "timestamp": "DateTime",
-#    "text": "Text",
-#    "Text": "Text",
-#    "blob": "Blob",
-#    "byte[]": "byte[]",
-#    "uuid": "UUID",
-#    "UUID": "UUID",
-#}
-
-# Tipos canónicos DevForge ↔ tipos EA
-_DEVFORE_A_EA = {
+# Tipos canónicos DevForge → equivalentes EA (UML 1.3 usa los nombres
+# de los primitivos del lenguaje: char, int, long, float, ...)
+_DEVFORGE_A_EA = {
     "String": "char",
     "Text": "text",
     "Integer": "int",
@@ -112,7 +158,10 @@ _DEVFORE_A_EA = {
     "byte[]": "blob",
 }
 
-_TIPOS_EA_A_DEVFORE = {
+# Normalización de tipos EA (UML 1.3) → tipos canónicos DevForge.
+# Los tipos desconocidos pasan tal cual (el gate de la Tanda 18 los
+# reporta como TIPO_NO_MAPEADO al momento de generar código).
+_TIPOS_EA_A_DEVFORGE = {
     "char": "String", "varchar": "String", "string": "String", "String": "String",
     "text": "Text", "Text": "Text",
     "int": "Integer", "integer": "Integer", "Integer": "Integer",
@@ -129,102 +178,71 @@ _TIPOS_EA_A_DEVFORE = {
     "blob": "byte[]", "byte[]": "byte[]",
 }
 
+
 # ======================================================================
 # DIAGRAMA → XMI (formato DevForge AI)
 # ======================================================================
-def diagrama_a_xmiiii(diagrama: Any) -> str:
-    """
-    Serializa un Diagrama ORM (con sus clases, atributos, operaciones,
-    parámetros e interfaces cargados) a un string XML en formato DevForge.
-    """
-    root = ET.Element(
-        f"{{{XMI_NS}}}XMI",
-        attrib={
-            "version": "2.5.1",
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        },
-    )
-    meta = ET.SubElement(
-        root,
-        f"{{{XMI_NS}}}Documentation",
-        attrib={
-            "exporter": "DevForge AI",
-            "diagrama_id": str(getattr(diagrama, "id", "")),
-            "diagrama_nombre": getattr(diagrama, "nombre", ""),
-            "version_uml": getattr(diagrama, "version_uml", "2.5.1"),
-            "numero_version": str(getattr(diagrama, "numero_version", 1)),
-        },
-    )
-    meta.text = f"Diagrama exportado por DevForge AI: {getattr(diagrama, 'nombre', '')}"
-
-    model = ET.SubElement(
-        root,
-        f"{{{UML_NS}}}Model",
-        attrib={f"{{{XMI_NS}}}id": f"model_{getattr(diagrama, 'id', 0)}"},
-    )
-
-    for clase in getattr(diagrama, "clases", []) or []:
-        _clase_a_xml(model, clase)
-    for interfaz in getattr(diagrama, "interfaces", []) or []:
-        _interfaz_a_xml(model, interfaz)
-    for relacion in getattr(diagrama, "relaciones", []) or []:
-        _relacion_a_xml(model, relacion)
-
-    _indent(root)
-    return ET.tostring(root, encoding="unicode", xml_declaration=False)
-
-def _diagrama_a_xmi_devforge(diagrama: Any) -> str:
-    """
-    Serializa un Diagrama ORM (con sus clases, atributos, operaciones,
-    parámetros e interfaces cargados) a un string XML en formato DevForge.
-    """
-    root = ET.Element(
-        f"{{{XMI_NS}}}XMI",
-        attrib={
-            "version": "2.5.1",
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-        },
-    )
-    meta = ET.SubElement(
-        root,
-        f"{{{XMI_NS}}}Documentation",
-        attrib={
-            "exporter": "DevForge AI",
-            "diagrama_id": str(getattr(diagrama, "id", "")),
-            "diagrama_nombre": getattr(diagrama, "nombre", ""),
-            "version_uml": getattr(diagrama, "version_uml", "2.5.1"),
-            "numero_version": str(getattr(diagrama, "numero_version", 1)),
-        },
-    )
-    meta.text = f"Diagrama exportado por DevForge AI: {getattr(diagrama, 'nombre', '')}"
-
-    model = ET.SubElement(
-        root,
-        f"{{{UML_NS}}}Model",
-        attrib={f"{{{XMI_NS}}}id": f"model_{getattr(diagrama, 'id', 0)}"},
-    )
-
-    for clase in getattr(diagrama, "clases", []) or []:
-        _clase_a_xml(model, clase)
-    for interfaz in getattr(diagrama, "interfaces", []) or []:
-        _interfaz_a_xml(model, interfaz)
-    for relacion in getattr(diagrama, "relaciones", []) or []:
-        _relacion_a_xml(model, relacion)
-
-    _indent(root)
-    return ET.tostring(root, encoding="unicode", xml_declaration=False)
-
 def diagrama_a_xmi(diagrama: Any, formato: str = "devforge") -> str:
     """
     Serializa un Diagrama ORM a XMI.
     - formato="devforge" (default): XMI 2.5 con namespaces UML 2.5.
     - formato="ea": XMI 1.1 / UML 1.3 compatible con Enterprise Architect.
     """
-    if formato.lower() == "ea":
+    formato_norm = (formato or "devforge").lower()
+    if formato_norm == "ea":
         return _diagrama_a_xmi_ea(diagrama)
     return _diagrama_a_xmi_devforge(diagrama)
 
+
+def _diagrama_a_xmi_devforge(diagrama: Any) -> str:
+    """
+    Serializa un Diagrama (con sus clases, atributos, operaciones,
+    parámetros e interfaces embebidas) a un string XML en formato
+    DevForge (XMI 2.5 / UML 2.5).
+    """
+    diagrama_id = str(getattr(diagrama, "id", "") or "")
+
+    root = ET.Element(
+        f"{{{XMI_NS}}}XMI",
+        attrib={
+            "version": "2.5.1",
+            "timestamp": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        },
+    )
+    meta = ET.SubElement(
+        root,
+        f"{{{XMI_NS}}}Documentation",
+        attrib={
+            "exporter": "DevForge AI",
+            "diagrama_id": diagrama_id,
+            "diagrama_nombre": getattr(diagrama, "nombre", ""),
+            "version_uml": getattr(diagrama, "version_uml", "2.5.1"),
+            "numero_version": str(getattr(diagrama, "numero_version", 1)),
+        },
+    )
+    meta.text = f"Diagrama exportado por DevForge AI: {getattr(diagrama, 'nombre', '')}"
+
+    model = ET.SubElement(
+        root,
+        f"{{{UML_NS}}}Model",
+        attrib={f"{{{XMI_NS}}}id": f"model_{diagrama_id}"},
+    )
+
+    for clase in getattr(diagrama, "clases", []) or []:
+        _clase_a_xml(model, clase)
+    for interfaz in getattr(diagrama, "interfaces", []) or []:
+        _interfaz_a_xml(model, interfaz)
+    for relacion in getattr(diagrama, "relaciones", []) or []:
+        _relacion_a_xml(model, relacion)
+
+    _indent(root)
+    return ET.tostring(root, encoding="unicode", xml_declaration=False)
+
+
 def _clase_a_xml(parent: ET.Element, clase: Any) -> None:
+    """Genera un <Class> DevForge con atributos y operaciones embebidas."""
     atrs = {
         f"{{{XMI_NS}}}id": f"clase_{clase.id}",
         f"{{{XMI_NS}}}type": "uml:Class",
@@ -279,6 +297,7 @@ def _clase_a_xml(parent: ET.Element, clase: Any) -> None:
 
 
 def _interfaz_a_xml(parent: ET.Element, interfaz: Any) -> None:
+    """Genera un <Interface> DevForge con sus operaciones declaradas."""
     iface_el = ET.SubElement(
         parent,
         "Interface",
@@ -302,6 +321,7 @@ def _interfaz_a_xml(parent: ET.Element, interfaz: Any) -> None:
 
 
 def _relacion_a_xml(parent: ET.Element, relacion: Any) -> None:
+    """Genera el elemento de relación DevForge (tag según el tipo)."""
     tag = _TIPO_A_TAG.get(relacion.tipo_relacion, "Association")
     atrs = {
         f"{{{XMI_NS}}}id": f"rel_{relacion.id}",
@@ -324,6 +344,7 @@ def _relacion_a_xml(parent: ET.Element, relacion: Any) -> None:
 
 
 def _vis_a_xmi(vis: str) -> str:
+    """Visibilidad DevForge ('+', '-', '#', '~') → palabra XMI."""
     return {
         "+": "public",
         "-": "private",
@@ -333,6 +354,7 @@ def _vis_a_xmi(vis: str) -> str:
 
 
 def _vis_desde_xmi(vis: str) -> str:
+    """Palabra XMI → visibilidad DevForge ('+', '-', '#', '~')."""
     return {
         "public": "+",
         "private": "-",
@@ -342,6 +364,7 @@ def _vis_desde_xmi(vis: str) -> str:
 
 
 def _indent(elem: ET.Element, level: int = 0) -> None:
+    """Indentación en árbol para que el XML quede legible."""
     i = "\n" + level * "  "
     if len(elem):
         if not elem.text or not elem.text.strip():
@@ -370,8 +393,9 @@ def xmi_a_estructura(xml_str: str) -> dict[str, Any]:
     }
 
     Detecta automáticamente el formato:
-    - Enterprise Architect (UML 1.3 / XMI 1.1)
-    - DevForge AI (UML 2.5 / XMI 2.5)
+    - DevForge AI (UML 2.5 / XMI 2.5, raíz <xmi:XMI> con namespace OMG)
+    - Enterprise Architect (UML 1.3 / XMI 1.1, raíz <XMI> con
+      <XMI.content>)
 
     Lanza `BadRequestError` si el XML es inválido o no se reconoce.
     """
@@ -400,29 +424,38 @@ def xmi_a_estructura(xml_str: str) -> dict[str, Any]:
 def _detectar_formato(root: ET.Element) -> str:
     """
     Detecta el formato del XMI según la estructura de la raíz.
+
+    IMPORTANTE: el chequeo DevForge va PRIMERO. La raíz <xmi:XMI> de
+    DevForge también tiene localname "XMI" y un <Model> dentro, así que
+    si se evaluara después del chequeo EA caería en la rama equivocada
+    (bug del Ciclo 1 que partía el round-trip DevForge→DevForge).
     """
     tag_root = _localname(root.tag)
 
-    # Enterprise Architect: raíz <XMI> con <XMI.content>
-    if tag_root == "XMI":
-        # ¿Tiene un <XMI.content> dentro?
-        for child in root:
-            if _localname(child.tag) == "content":
-                return "enterprise_architect"
-        # Raíz <XMI> pero sin content → ver si hay UML:Model dentro
-        # (algunos XMI sin XMI.content)
-        for child in root.iter():
-            if _localname(child.tag) == "Model":
-                return "enterprise_architect"
-
-    # DevForge AI: raíz <xmi:XMI> con xmlns:xmi apuntando a omg.org/spec/XMI/...
+    # 1) DevForge AI: raíz <xmi:XMI> con el namespace OMG de XMI en el
+    #    propio tag. Solo el formato propio usa namespaces.
     if tag_root == "XMI" and "omg.org/spec/XMI" in str(root.tag):
         return "devforge"
 
-    # Fallback: si tiene un <UML:Model> en algún lado, es EA-like
+    # 2) Enterprise Architect: raíz <XMI> SIN namespace con
+    #    <XMI.content> dentro.
+    if tag_root == "XMI":
+        for child in root:
+            if _localname(child.tag) == "content":
+                return "enterprise_architect"
+        # Algunos XMI vienen sin XMI.content: si hay un <Model> en algún
+        # lado es EA-like, salvo que las clases traigan la firma propia
+        # de DevForge (pos_x como atributo plano del <Class>).
+        for child in root.iter():
+            if _localname(child.tag) == "Model":
+                for c in child.iter():
+                    if _localname(c.tag) == "Class" and "pos_x" in c.attrib:
+                        return "devforge"
+                return "enterprise_architect"
+
+    # 3) Fallback: raíz rara pero con un <Model> dentro.
     for child in root.iter():
         if _localname(child.tag) == "Model":
-            # Si tiene atributos DevForge específicos (pos_x, isAbstract en Class)
             for c in child.iter():
                 if _localname(c.tag) == "Class" and "pos_x" in c.attrib:
                     return "devforge"
@@ -477,7 +510,7 @@ def _parsear_enterprise_architect(root: ET.Element) -> dict[str, Any]:
             if xmi_id:
                 id_a_nombre[xmi_id] = nombre
 
-            pos = posiciones.get(xmi_id, (0.0, 0.0))
+            pos = posiciones.get(xmi_id or "", (0.0, 0.0))
             clase = _parsear_clase_ea(el, tipos_por_id, pos)
             clases.append(clase)
 
@@ -488,54 +521,15 @@ def _parsear_enterprise_architect(root: ET.Element) -> dict[str, Any]:
             xmi_id = el.attrib.get("xmi.id")
             if xmi_id:
                 id_a_nombre[xmi_id] = nombre
-            pos = posiciones.get(xmi_id, (0.0, 0.0))
+            pos = posiciones.get(xmi_id or "", (0.0, 0.0))
             interfaz = _parsear_interfaz_ea(el, pos)
             interfaces.append(interfaz)
 
-    # Paso 4: recolectar relaciones (Association, Generalization, etc.)
-    #relaciones: list[dict[str, Any]] = []
-    #for el in root.iter():
-    #    tag = _localname(el.tag)
-    #    if tag == "Association":
-    #        rel = _parsear_association_ea(el, id_a_nombre)
-    #        if rel is not None:
-    #            relaciones.append(rel)
-    #    elif tag == "Generalization":
-    #        # <UML:Generalization child="EAID_..." parent="EAID_..."/>
-    #        # child hereda de parent → origen (hijo) → destino (padre)
-    #        rel = _parsear_generalization_ea(el, id_a_nombre)
-    #        if rel is not None:
-    #            relaciones.append(rel)
-#
-
-    # Paso 4: recolectar relaciones (Association, Generalization, etc.)
-    # Primero identificamos las Association Classes de EA: son clases cuyo
-    # xmi.id aparece referenciado por el tag "associationclass" de alguna
-    # Association. Estas clases NO se tratan como tablas sueltas: la
-    # relación M:N se reemplaza por dos relaciones 1:N intermediadas por
-    # la clase intermedia.
-    association_class_ids: set[str] = set()
-    associations_por_id: dict[str, ET.Element] = {}
-
-    # Primera pasada: juntar los tags "associationclass" y los Associations
-    for el in root.iter():
-        tag = _localname(el.tag)
-        if tag == "Association":
-            xmi_id = el.attrib.get("xmi.id")
-            if xmi_id:
-                associations_por_id[xmi_id] = el
-            # Buscar el tag "associationclass"
-            for child in el:
-                if _localname(child.tag) == "ModelElement.taggedValue":
-                    for tv in child:
-                        if _localname(tv.tag) != "TaggedValue":
-                            continue
-                        if tv.attrib.get("tag") == "associationclass":
-                            ac_id = tv.attrib.get("value")
-                            if ac_id:
-                                association_class_ids.add(ac_id)
-
-    # Segunda pasada: procesar relaciones
+    # Paso 4: recolectar relaciones (Association, Generalization, etc.).
+    # Las Association Classes de EA son clases cuyo xmi.id aparece en el
+    # TaggedValue "associationclass" de una Association: NO se tratan
+    # como tablas sueltas; la relación M:N se reemplaza por DOS
+    # relaciones 1:N intermediadas por la clase intermedia.
     relaciones: list[dict[str, Any]] = []
 
     for el in root.iter():
@@ -544,18 +538,20 @@ def _parsear_enterprise_architect(root: ET.Element) -> dict[str, Any]:
             # ¿Es una Association con AssociationClass?
             ac_id = _extraer_association_class_id(el)
             if ac_id and ac_id in id_a_nombre:
-                # Es una asociación con clase intermedia → generar DOS
-                # relaciones: origen → intermedia, intermedia → destino.
                 rels = _parsear_association_con_clase_ea(
                     el, id_a_nombre, ac_id
                 )
-                relaciones.extend(rels)
-            else:
-                # Asociación normal
-                rel = _parsear_association_ea(el, id_a_nombre)
-                if rel is not None:
-                    relaciones.append(rel)
+                if rels:
+                    relaciones.extend(rels)
+                    continue
+            # Asociación normal (o AssociationClass que no se pudo
+            # resolver: mejor conservarla como asociación simple)
+            rel = _parsear_association_ea(el, id_a_nombre)
+            if rel is not None:
+                relaciones.append(rel)
         elif tag == "Generalization":
+            # <UML:Generalization child="EAID_..." parent="EAID_..."/>
+            # child hereda de parent → origen (hijo) → destino (padre)
             rel = _parsear_generalization_ea(el, id_a_nombre)
             if rel is not None:
                 relaciones.append(rel)
@@ -570,6 +566,7 @@ def _parsear_enterprise_architect(root: ET.Element) -> dict[str, Any]:
         "interfaces": interfaces,
         "relaciones": relaciones,
     }
+
 
 def _extraer_association_class_id(el: ET.Element) -> Optional[str]:
     """Devuelve el xmi.id de la AssociationClass referenciada, si la hay."""
@@ -649,6 +646,7 @@ def _parsear_association_con_clase_ea(
 
     return [rel1, rel2]
 
+
 def _parsear_clase_ea(
     el: ET.Element,
     tipos_por_id: dict[str, str],
@@ -673,10 +671,14 @@ def _parsear_clase_ea(
 
     pos_x, pos_y = posicion
 
+    # El estereotipo viaja en un TaggedValue "stereotype" (lo escribe el
+    # exportador de DevForge; EA lo ignora si no lo conoce).
+    estereotipo = _tagged_value_de(el, "stereotype")
+
     return {
         "nombre": el.attrib.get("name", "").strip(),
         "es_abstracta": el.attrib.get("isAbstract", "false").lower() == "true",
-        "estereotipo": None,
+        "estereotipo": estereotipo,
         "pos_x": pos_x,
         "pos_y": pos_y,
         "atributos": atributos,
@@ -694,18 +696,27 @@ def _parsear_attribute_ea(
     nombre = el.attrib.get("name", "").strip()
     visibility_ea = el.attrib.get("visibility", "private")
 
-    # Tipo: primero buscamos en <UML:TaggedValue tag="type">
-    tipo = None
+    # TaggedValues de EA:
+    # - "type": el tipo explícito (convención de EA)
+    # - "position": orden del atributo dentro de la clase
+    # - "defaultValue": valor inicial (lo escribe el exportador DevForge)
+    tipo: Optional[str] = None
+    orden = 0
+    valor_defecto: Optional[str] = None
+
     for child in el:
-        if _localname(child.tag) == "ModelElement.taggedValue":
-            for tv in child:
-                if _localname(tv.tag) != "TaggedValue":
-                    continue
-                if tv.attrib.get("tag") == "type":
-                    tipo = tv.attrib.get("value", "").strip()
-                    break
-        if tipo:
-            break
+        if _localname(child.tag) != "ModelElement.taggedValue":
+            continue
+        for tv in child:
+            if _localname(tv.tag) != "TaggedValue":
+                continue
+            tag_tv = tv.attrib.get("tag")
+            if tag_tv == "type" and tipo is None:
+                tipo = (tv.attrib.get("value") or "").strip() or None
+            elif tag_tv == "position":
+                orden = _safe_int(tv.attrib.get("value"), 0)
+            elif tag_tv == "defaultValue":
+                valor_defecto = tv.attrib.get("value") or None
 
     # Fallback: resolver por xmi.idref apuntando a un DataType
     if not tipo:
@@ -722,27 +733,17 @@ def _parsear_attribute_ea(
         tipo = "String"
 
     # Normalizar el tipo al vocabulario de DevForge
-    tipo = _TIPOS_EA_A_DEVFORE.get(tipo, tipo or "String")
+    tipo = _TIPOS_EA_A_DEVFORGE.get(tipo, tipo)
 
-    # Orden: extraer del taggedValue "position" si existe
-    orden = 0
-    for child in el:
-        if _localname(child.tag) == "ModelElement.taggedValue":
-            for tv in child:
-                if _localname(tv.tag) != "TaggedValue":
-                    continue
-                if tv.attrib.get("tag") == "position":
-                    try:
-                        orden = int(tv.attrib.get("value", "0"))
-                    except (TypeError, ValueError):
-                        pass
+    # EA marca los atributos estáticos con ownerScope="classifier"
+    es_estatico = el.attrib.get("ownerScope", "instance").lower() == "classifier"
 
     return {
         "nombre": nombre,
         "tipo_dato": tipo,
         "visibilidad": _vis_desde_ea(visibility_ea),
-        "es_estatico": False,
-        "valor_defecto": None,
+        "es_estatico": es_estatico,
+        "valor_defecto": valor_defecto,
         "orden": orden,
     }
 
@@ -757,19 +758,23 @@ def _parsear_operation_ea(
     nombre = el.attrib.get("name", "").strip()
     visibility_ea = el.attrib.get("visibility", "public")
 
-    # Tipo de retorno: en EA puede estar en taggedValue "type" o "returnType"
+    # Tipo de retorno: en EA puede estar en taggedValue "type",
+    # "returnType" o "return_type" (DevForge escribe "returnType").
     tipo_retorno = "void"
+    orden = 0
     for child in el:
-        if _localname(child.tag) == "ModelElement.taggedValue":
-            for tv in child:
-                if _localname(tv.tag) != "TaggedValue":
-                    continue
-                tag = tv.attrib.get("tag")
-                if tag in ("type", "returnType", "return_type"):
-                    tipo_retorno = tv.attrib.get("value", "void") or "void"
-                    break
+        if _localname(child.tag) != "ModelElement.taggedValue":
+            continue
+        for tv in child:
+            if _localname(tv.tag) != "TaggedValue":
+                continue
+            tag_tv = tv.attrib.get("tag")
+            if tag_tv in ("type", "returnType", "return_type"):
+                tipo_retorno = tv.attrib.get("value", "void") or "void"
+            elif tag_tv == "position":
+                orden = _safe_int(tv.attrib.get("value"), 0)
 
-    tipo_retorno = _TIPOS_EA_A_DEVFORE.get(tipo_retorno, tipo_retorno)
+    tipo_retorno = _TIPOS_EA_A_DEVFORGE.get(tipo_retorno, tipo_retorno)
 
     # Parámetros: <UML:Parameter> dentro de <UML:BehavioralFeature.parameter>
     parametros: list[dict[str, Any]] = []
@@ -786,19 +791,22 @@ def _parsear_operation_ea(
                     for tv in sub:
                         if _localname(tv.tag) == "TaggedValue" and tv.attrib.get("tag") == "type":
                             p_tipo = tv.attrib.get("value", "String") or "String"
-            p_tipo = _TIPOS_EA_A_DEVFORE.get(p_tipo, p_tipo)
+            p_tipo = _TIPOS_EA_A_DEVFORGE.get(p_tipo, p_tipo)
             parametros.append({
                 "nombre": p_nombre,
                 "tipo_dato": p_tipo,
                 "orden": len(parametros),
             })
 
+    # EA marca las operaciones estáticas con ownerScope="classifier"
+    es_estatico = el.attrib.get("ownerScope", "instance").lower() == "classifier"
+
     return {
         "nombre": nombre,
         "tipo_retorno": tipo_retorno,
         "visibilidad": _vis_desde_ea(visibility_ea),
-        "es_estatico": False,
-        "orden": 0,
+        "es_estatico": es_estatico,
+        "orden": orden,
         "parametros": parametros,
     }
 
@@ -813,9 +821,22 @@ def _parsear_interfaz_ea(
             continue
         for hijo in feature:
             if _localname(hijo.tag) == "Operation":
+                # El tipo de retorno ya no es "void" fijo: se lee el
+                # TaggedValue del tipo (misma regla que las operaciones
+                # de clase) y se normaliza.
+                tipo_retorno = "void"
+                for child in hijo:
+                    if _localname(child.tag) != "ModelElement.taggedValue":
+                        continue
+                    for tv in child:
+                        if _localname(tv.tag) == "TaggedValue" and tv.attrib.get("tag") in (
+                            "type", "returnType", "return_type"
+                        ):
+                            tipo_retorno = tv.attrib.get("value", "void") or "void"
+                tipo_retorno = _TIPOS_EA_A_DEVFORGE.get(tipo_retorno, tipo_retorno)
                 operaciones.append({
                     "nombre": hijo.attrib.get("name", "").strip(),
-                    "tipo_retorno": "void",
+                    "tipo_retorno": tipo_retorno,
                 })
     pos_x, pos_y = posicion
     return {
@@ -863,28 +884,47 @@ def _parsear_association_ea(
     mult_origen = _validar_multiplicidad_segura(ends[0].attrib.get("multiplicity"))
     mult_destino = _validar_multiplicidad_segura(ends[1].attrib.get("multiplicity"))
 
-    # Buscar nombre de la asociación en taggedValue
-    nombre_asociacion = None
+    # TaggedValues de la asociación (un solo barrido):
+    # - "name": nombre de la asociación (lo escribe DevForge; EA también
+    #   guarda el nombre en un tagged value cuando la hay)
+    # - "tipo_relacion": hint que escribe el exportador de DevForge para
+    #   las relaciones que EA serializa como Association igual que las
+    #   asociaciones (DEPENDENCIA, REALIZACION)
+    nombre_asociacion: Optional[str] = None
+    hint_tipo: Optional[str] = None
     for child in el:
-        if _localname(child.tag) == "ModelElement.taggedValue":
-            for tv in child:
-                if _localname(tv.tag) != "TaggedValue":
-                    continue
-                if tv.attrib.get("tag") == "name":
-                    nombre_asociacion = tv.attrib.get("value") or None
+        if _localname(child.tag) != "ModelElement.taggedValue":
+            continue
+        for tv in child:
+            if _localname(tv.tag) != "TaggedValue":
+                continue
+            tag_tv = tv.attrib.get("tag")
+            if tag_tv == "name" and nombre_asociacion is None:
+                nombre_asociacion = tv.attrib.get("value") or None
+            elif tag_tv == "tipo_relacion":
+                hint_tipo = (tv.attrib.get("value") or "").strip().upper() or None
 
-    # Detectar tipo de relación específico
-    # En EA las aggregations y compositions vienen con un taggedValue
-    # "ea_type" o atributos aggregation en los AssociationEnd.
-    tipo = "ASOCIACION"
-    for end in ends:
-        agg = end.attrib.get("aggregation", "none").lower()
-        if agg == "composite":
-            tipo = "COMPOSICION"
-            break
-        elif agg == "aggregate":
-            tipo = "AGREGACION"
-            break
+    # Roles: en UML 1.3 el nombre del extremo ES el rol
+    rol_origen = ends[0].attrib.get("name") or None
+    rol_destino = ends[1].attrib.get("name") or None
+
+    # Tipo de la relación, en orden de prioridad:
+    # 1) hint "tipo_relacion" del exportador de DevForge;
+    # 2) atributo aggregation de los extremos (EA nativo):
+    #    composite → COMPOSICION, aggregate → AGREGACION;
+    # 3) ASOCIACION por defecto.
+    if hint_tipo in _TIPOS_RELACION:
+        tipo = hint_tipo
+    else:
+        tipo = "ASOCIACION"
+        for end in ends:
+            agg = end.attrib.get("aggregation", "none").lower()
+            if agg == "composite":
+                tipo = "COMPOSICION"
+                break
+            elif agg == "aggregate":
+                tipo = "AGREGACION"
+                break
 
     return {
         "origen": origen_nombre,
@@ -893,8 +933,8 @@ def _parsear_association_ea(
         "multiplicidad_origen": mult_origen,
         "multiplicidad_destino": mult_destino,
         "nombre_asociacion": nombre_asociacion,
-        "rol_origen": None,
-        "rol_destino": None,
+        "rol_origen": rol_origen,
+        "rol_destino": rol_destino,
     }
 
 
@@ -960,13 +1000,25 @@ def _validar_multiplicidad_segura(valor: Optional[str]) -> Optional[str]:
         return valor
 
 
+def _tagged_value_de(el: ET.Element, tag_buscado: str) -> Optional[str]:
+    """Devuelve el value del primer TaggedValue con ese tag (o None)."""
+    for child in el:
+        if _localname(child.tag) != "ModelElement.taggedValue":
+            continue
+        for tv in child:
+            if _localname(tv.tag) != "TaggedValue":
+                continue
+            if tv.attrib.get("tag") == tag_buscado:
+                return tv.attrib.get("value") or None
+    return None
+
+
 # ======================================================================
-# PARSER: DevForge AI (UML 2.5 / XMI 2.5) — el original
+# PARSER: DevForge AI (UML 2.5 / XMI 2.5)
 # ======================================================================
 def _parsear_devforge(root: ET.Element) -> dict[str, Any]:
     """
-    Parser para el formato propio de DevForge AI (el que ya funcionaba).
-    Se mantiene intacto salvo que ahora se invoca desde el dispatcher.
+    Parser para el formato propio de DevForge AI.
     """
     id_a_nombre: dict[str, str] = {}
     clases: list[dict[str, Any]] = []
@@ -1143,17 +1195,27 @@ def _safe_float(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return default
 
+
+# ======================================================================
+# DIAGRAMA → XMI (formato Enterprise Architect, XMI 1.1 / UML 1.3)
+# ======================================================================
 def _diagrama_a_xmi_ea(diagrama: Any) -> str:
     """
-    Serializa un Diagrama ORM en formato XMI 1.1 / UML 1.3 compatible
+    Serializa un Diagrama en formato XMI 1.1 / UML 1.3 compatible
     con Enterprise Architect.
+
+    Fidelidad respecto al Ciclo 1: ahora también exporta las
+    OPERACIONES (con parámetros), las INTERFACES (con posición) y las
+    GENERALIZACIONES como <UML:Generalization>; DEPENDENCIA y
+    REALIZACION viajan como Association + TaggedValue "tipo_relacion"
+    que el importador de DevForge restaura.
     """
     import uuid
 
     # Root
     root = ET.Element("XMI", attrib={
         "xmi.version": "1.1",
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     })
     root.set("xmlns:UML", "omg.org/UML1.3")
 
@@ -1183,8 +1245,8 @@ def _diagrama_a_xmi_ea(diagrama: Any) -> str:
     })
     pkg_owned = ET.SubElement(package, "UML:Namespace.ownedElement")
 
-    # Mapeo: id de clase → xmi.id generado
-    id_a_xmi: dict[int, str] = {}
+    # Mapeo: id de clase/interfaz → xmi.id generado
+    id_a_xmi: dict[str, str] = {}
 
     # Clases
     for clase in getattr(diagrama, "clases", []) or []:
@@ -1192,13 +1254,26 @@ def _diagrama_a_xmi_ea(diagrama: Any) -> str:
         id_a_xmi[clase.id] = xmi_id
         _clase_a_xml_ea(pkg_owned, clase, xmi_id)
 
+    # Interfaces
+    for interfaz in getattr(diagrama, "interfaces", []) or []:
+        xmi_id = f"EAID_{interfaz.id}_{uuid.uuid4().hex[:8]}"
+        id_a_xmi[interfaz.id] = xmi_id
+        _interfaz_a_xml_ea(pkg_owned, interfaz, xmi_id)
+
     # Relaciones
     for relacion in getattr(diagrama, "relaciones", []) or []:
         origen_xmi = id_a_xmi.get(relacion.id_clase_origen)
         destino_xmi = id_a_xmi.get(relacion.id_clase_destino)
         if not origen_xmi or not destino_xmi:
             continue
-        _relacion_a_xml_ea(pkg_owned, relacion, origen_xmi, destino_xmi)
+        if relacion.tipo_relacion == "GENERALIZACION":
+            # La herencia se exporta con su elemento UML propio
+            # (child hereda de parent → origen=hijo, destino=padre)
+            _generalizacion_a_xml_ea(
+                pkg_owned, relacion, origen_xmi, destino_xmi
+            )
+        else:
+            _relacion_a_xml_ea(pkg_owned, relacion, origen_xmi, destino_xmi)
 
     # Diagrama visual (posiciones) — opcional pero útil para que EA lo abra bien
     diagram = ET.SubElement(content, "UML:Diagram", attrib={
@@ -1209,16 +1284,20 @@ def _diagrama_a_xmi_ea(diagrama: Any) -> str:
         "toolName": "DevForge AI",
     })
     diagram_element = ET.SubElement(diagram, "UML:Diagram.element")
-    for clase in getattr(diagrama, "clases", []) or []:
-        xmi_id = id_a_xmi.get(clase.id)
+    for indice, elemento in enumerate(
+        list(getattr(diagrama, "clases", []) or [])
+        + list(getattr(diagrama, "interfaces", []) or []),
+        start=1,
+    ):
+        xmi_id = id_a_xmi.get(elemento.id)
         if not xmi_id:
             continue
-        left = int(clase.pos_x or 0)
-        top = int(clase.pos_y or 0)
+        left = int(elemento.pos_x or 0)
+        top = int(elemento.pos_y or 0)
         ET.SubElement(diagram_element, "UML:DiagramElement", attrib={
             "geometry": f"Left={left};Top={top};Right={left + 90};Bottom={top + 70};",
             "subject": xmi_id,
-            "seqno": str(clase.id),
+            "seqno": str(indice),
         })
 
     # DataTypes (declarar los tipos usados)
@@ -1241,19 +1320,23 @@ def _clase_a_xml_ea(parent: ET.Element, clase: Any, xmi_id: str) -> None:
         "isActive": "false",
     })
 
-    if clase.atributos:
+    if clase.atributos or clase.operaciones:
         feature = ET.SubElement(class_el, "UML:Classifier.feature")
         for attr in clase.atributos:
             attr_el = ET.SubElement(feature, "UML:Attribute", attrib={
                 "name": attr.nombre,
                 "visibility": _vis_a_xmi(attr.visibilidad),
                 "changeable": "none",
-                "ownerScope": "instance",
+                # Los estáticos viajan como classifier (convención UML)
+                "ownerScope": (
+                    "classifier" if getattr(attr, "es_estatico", False)
+                    else "instance"
+                ),
                 "targetScope": "instance",
             })
             # StructuralFeature.type (referencia al DataType)
             sft = ET.SubElement(attr_el, "UML:StructuralFeature.type")
-            tipo_ea = _DEVFORE_A_EA.get(attr.tipo_dato, "char")
+            tipo_ea = _DEVFORGE_A_EA.get(attr.tipo_dato, attr.tipo_dato or "char")
             ET.SubElement(sft, "UML:Classifier", attrib={
                 "xmi.idref": f"eaxmiid_{tipo_ea}",
             })
@@ -1265,12 +1348,109 @@ def _clase_a_xml_ea(parent: ET.Element, clase: Any, xmi_id: str) -> None:
             ET.SubElement(tv_container, "UML:TaggedValue", attrib={
                 "tag": "position", "value": str(attr.orden),
             })
+            if getattr(attr, "valor_defecto", None):
+                ET.SubElement(tv_container, "UML:TaggedValue", attrib={
+                    "tag": "defaultValue", "value": attr.valor_defecto,
+                })
+        _operaciones_a_xml_ea(feature, clase)
+
+    # Estereotipo (TaggedValue; EA ignora los que no conoce)
+    if getattr(clase, "estereotipo", None):
+        tv_clase = ET.SubElement(class_el, "UML:ModelElement.taggedValue")
+        ET.SubElement(tv_clase, "UML:TaggedValue", attrib={
+            "tag": "stereotype", "value": clase.estereotipo,
+        })
+
+
+def _operaciones_a_xml_ea(feature: ET.Element, clase: Any) -> None:
+    """Genera los <UML:Operation> de una clase (con parámetros tipados)."""
+    for op in getattr(clase, "operaciones", []) or []:
+        tipo_retorno = getattr(op, "tipo_retorno", "void") or "void"
+        op_el = ET.SubElement(feature, "UML:Operation", attrib={
+            "name": op.nombre,
+            "visibility": _vis_a_xmi(getattr(op, "visibilidad", "+")),
+            "ownerScope": (
+                "classifier" if getattr(op, "es_estatico", False)
+                else "instance"
+            ),
+        })
+        tv_container = ET.SubElement(op_el, "UML:ModelElement.taggedValue")
+        ET.SubElement(tv_container, "UML:TaggedValue", attrib={
+            "tag": "returnType",
+            "value": _DEVFORGE_A_EA.get(tipo_retorno, tipo_retorno),
+        })
+        ET.SubElement(tv_container, "UML:TaggedValue", attrib={
+            "tag": "position", "value": str(getattr(op, "orden", 0)),
+        })
+        params = ET.SubElement(op_el, "UML:BehavioralFeature.parameter")
+        for param in getattr(op, "parametros", []) or []:
+            p_tipo = _DEVFORGE_A_EA.get(param.tipo_dato, param.tipo_dato)
+            p_el = ET.SubElement(params, "UML:Parameter", attrib={
+                "name": param.nombre,
+                "kind": "in",
+            })
+            p_tv = ET.SubElement(p_el, "UML:ModelElement.taggedValue")
+            ET.SubElement(p_tv, "UML:TaggedValue", attrib={
+                "tag": "type", "value": p_tipo,
+            })
+
+
+def _interfaz_a_xml_ea(
+    parent: ET.Element, interfaz: Any, xmi_id: str
+) -> None:
+    """Genera un <UML:Interface> en formato EA (con sus operaciones)."""
+    iface_el = ET.SubElement(parent, "UML:Interface", attrib={
+        "name": interfaz.nombre,
+        "xmi.id": xmi_id,
+        "visibility": "public",
+        "isRoot": "false",
+        "isLeaf": "false",
+        "isAbstract": "false",
+    })
+    if getattr(interfaz, "operaciones", None):
+        feature = ET.SubElement(iface_el, "UML:Classifier.feature")
+        for op in interfaz.operaciones:
+            tipo_retorno = getattr(op, "tipo_retorno", "void") or "void"
+            op_el = ET.SubElement(feature, "UML:Operation", attrib={
+                "name": op.nombre,
+                "visibility": "public",
+            })
+            tv = ET.SubElement(op_el, "UML:ModelElement.taggedValue")
+            ET.SubElement(tv, "UML:TaggedValue", attrib={
+                "tag": "returnType",
+                "value": _DEVFORGE_A_EA.get(tipo_retorno, tipo_retorno),
+            })
+
+
+def _generalizacion_a_xml_ea(
+    parent: ET.Element, relacion: Any, child_xmi: str, parent_xmi: str
+) -> None:
+    """
+    Genera un <UML:Generalization> en formato EA.
+    child hereda de parent: el ORIGEN de la relación es el hijo.
+    """
+    ET.SubElement(parent, "UML:Generalization", attrib={
+        "xmi.id": f"EAID_gen_{relacion.id}",
+        "visibility": "public",
+        "isRoot": "false",
+        "isLeaf": "false",
+        "isAbstract": "false",
+        "child": child_xmi,
+        "parent": parent_xmi,
+    })
 
 
 def _relacion_a_xml_ea(
     parent: ET.Element, relacion: Any, origen_xmi: str, destino_xmi: str
 ) -> None:
-    """Genera un <UML:Association> en formato EA."""
+    """
+    Genera un <UML:Association> en formato EA.
+
+    Las generalizaciones NO pasan por aquí (van como
+    <UML:Generalization>); DEPENDENCIA y REALIZACION viajan como
+    Association + TaggedValue "tipo_relacion" para que el round-trip
+    no las degrade a asociación.
+    """
     xmi_id = f"EAID_rel_{relacion.id}"
 
     assoc = ET.SubElement(parent, "UML:Association", attrib={
@@ -1283,46 +1463,74 @@ def _relacion_a_xml_ea(
 
     tv_container = ET.SubElement(assoc, "UML:ModelElement.taggedValue")
     ET.SubElement(tv_container, "UML:TaggedValue", attrib={"tag": "ea_type", "value": "Association"})
+    if relacion.tipo_relacion in ("DEPENDENCIA", "REALIZACION"):
+        ET.SubElement(tv_container, "UML:TaggedValue", attrib={
+            "tag": "tipo_relacion", "value": relacion.tipo_relacion,
+        })
+    if getattr(relacion, "nombre_asociacion", None):
+        ET.SubElement(tv_container, "UML:TaggedValue", attrib={
+            "tag": "name", "value": relacion.nombre_asociacion,
+        })
     if relacion.multiplicidad_origen:
         ET.SubElement(tv_container, "UML:TaggedValue", attrib={"tag": "lb", "value": relacion.multiplicidad_origen})
     if relacion.multiplicidad_destino:
         ET.SubElement(tv_container, "UML:TaggedValue", attrib={"tag": "rb", "value": relacion.multiplicidad_destino})
 
-    # Association.connection con dos AssociationEnd
+    # Association.connection con dos AssociationEnd. La multiplicidad
+    # es OPCIONAL en el DTD de UML 1.1: si la relación no la define no
+    # se rellena con "1" (el round-trip conserva el None; en el Ciclo 1
+    # el default "1" fabricaba multiplicidades en DEPENDENCIA/REALIZACION).
     conn = ET.SubElement(assoc, "UML:Association.connection")
     agg_origen = "composite" if relacion.tipo_relacion == "COMPOSICION" else (
         "aggregate" if relacion.tipo_relacion == "AGREGACION" else "none"
     )
-    ET.SubElement(conn, "UML:AssociationEnd", attrib={
+    end_origen_atrs = {
         "visibility": "public",
-        "multiplicity": relacion.multiplicidad_origen or "1",
         "aggregation": agg_origen,
         "isOrdered": "false",
         "targetScope": "instance",
         "changeable": "none",
         "isNavigable": "true",
         "type": origen_xmi,
-    })
-    ET.SubElement(conn, "UML:AssociationEnd", attrib={
+    }
+    if relacion.multiplicidad_origen:
+        end_origen_atrs["multiplicity"] = relacion.multiplicidad_origen
+    if getattr(relacion, "rol_origen", None):
+        # En UML 1.3 el nombre del extremo es el rol
+        end_origen_atrs["name"] = relacion.rol_origen
+    ET.SubElement(conn, "UML:AssociationEnd", attrib=end_origen_atrs)
+
+    end_destino_atrs = {
         "visibility": "public",
-        "multiplicity": relacion.multiplicidad_destino or "1",
         "aggregation": "none",
         "isOrdered": "false",
         "targetScope": "instance",
         "changeable": "none",
         "isNavigable": "true",
         "type": destino_xmi,
-    })
+    }
+    if relacion.multiplicidad_destino:
+        end_destino_atrs["multiplicity"] = relacion.multiplicidad_destino
+    if getattr(relacion, "rol_destino", None):
+        end_destino_atrs["name"] = relacion.rol_destino
+    ET.SubElement(conn, "UML:AssociationEnd", attrib=end_destino_atrs)
 
 
 def _declarar_datatypes_ea(parent: ET.Element, diagrama: Any) -> None:
-    """Declara los <UML:DataType> para todos los tipos usados."""
+    """Declara los <UML:DataType> para todos los tipos usados
+    (atributos, tipos de retorno no-void y parámetros; los tipos
+    desconocidos se declaran con su nombre tal cual para que el
+    xmi.idref de los atributos resuelva)."""
     tipos_usados: set[str] = set()
     for clase in getattr(diagrama, "clases", []) or []:
         for attr in getattr(clase, "atributos", []) or []:
-            tipo_ea = _DEVFORE_A_EA.get(attr.tipo_dato, "char")
-            tipos_usados.add(tipo_ea)
-
+            tipos_usados.add(_DEVFORGE_A_EA.get(attr.tipo_dato, attr.tipo_dato or "char"))
+        for op in getattr(clase, "operaciones", []) or []:
+            tipo_retorno = getattr(op, "tipo_retorno", "void") or "void"
+            if tipo_retorno != "void":
+                tipos_usados.add(_DEVFORGE_A_EA.get(tipo_retorno, tipo_retorno))
+            for param in getattr(op, "parametros", []) or []:
+                tipos_usados.add(_DEVFORGE_A_EA.get(param.tipo_dato, param.tipo_dato))
     for tipo in sorted(tipos_usados):
         ET.SubElement(parent, "UML:DataType", attrib={
             "xmi.id": f"eaxmiid_{tipo}",

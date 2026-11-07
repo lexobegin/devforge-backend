@@ -7,16 +7,27 @@ Esquemas Pydantic del módulo E. Intercambio de Modelos (XMI/XML):
 
 Además incluye los payloads específicos para disparar una exportación o
 una importación desde el cliente (no son entidades, son DTOs de operación).
+
+Cambios respecto al Ciclo 1:
+- Los ids int (serial/FK) pasan a PydanticObjectId de Beanie (se serializan
+  como string hex en JSON).
+- FormatoIntercambio conserva "EA" además de "XMI"/"XML": en el Ciclo 2 el
+  conversor lxml apunta al round-trip DevForge ↔ Enterprise Architect, y
+  estos registros documentan cada operación (estado EXITOSO/FALLIDO) para
+  depurar la compatibilidad — trazabilidad que el Ciclo 1 no daba.
+- ImportacionResultado.resumen pasa a dict[str, Any]: el conversor informa
+  clases/atributos/relaciones/advertencias reconstruidas.
 """
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
+from beanie import PydanticObjectId
 from pydantic import BaseModel, ConfigDict, Field
 
 
 # ======================================================================
-# Tipos reutilizables
+# Tipos reutilizables (alineados con app/models/intercambio.py)
 # ======================================================================
 FormatoIntercambio = Literal["XMI", "XML", "EA"]
 EstadoImportacion = Literal["PENDIENTE", "EXITOSO", "FALLIDO"]
@@ -39,10 +50,10 @@ class ExportacionDiagramaCreate(ExportacionDiagramaBase):
 class ExportacionDiagramaResponse(ExportacionDiagramaBase):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    id_diagrama: int
+    id: PydanticObjectId  # string hex en JSON (antes int serial)
+    id_diagrama: PydanticObjectId
     ruta_archivo: str
-    id_usuario: int
+    id_usuario: PydanticObjectId
     exported_at: datetime
 
 
@@ -68,10 +79,10 @@ class ImportacionDiagramaUpdate(BaseModel):
 class ImportacionDiagramaResponse(ImportacionDiagramaBase):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    id_diagrama: int
+    id: PydanticObjectId
+    id_diagrama: PydanticObjectId
     estado: EstadoImportacion
-    id_usuario: int
+    id_usuario: PydanticObjectId
     imported_at: datetime
 
 
@@ -95,7 +106,7 @@ class ImportacionResultado(BaseModel):
     """
 
     importacion: ImportacionDiagramaResponse
-    resumen: dict = Field(
+    resumen: dict[str, Any] = Field(
         default_factory=dict,
         description="Conteo de clases, atributos, relaciones… importados",
     )

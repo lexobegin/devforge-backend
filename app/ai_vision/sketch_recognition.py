@@ -17,6 +17,8 @@ Dependencias:
 
 Si alguna dependencia no está disponible, el módulo degrada con un
 mensaje claro en lugar de romper el servidor.
+
+CICLO 2: archivo conservado TAL CUAL del Ciclo 1 (Python puro, sin BD).
 """
 
 import logging

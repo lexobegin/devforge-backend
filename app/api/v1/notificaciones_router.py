@@ -1,6 +1,6 @@
 # app/api/v1/notificaciones_router.py
 """
-Endpoints del módulo I. Notificaciones:
+Endpoints del módulo I. Notificaciones — CICLO 2.
 
 - GET    /api/v1/notificaciones                        → listar mis notificaciones
 - GET    /api/v1/notificaciones/contador               → contador de no leídas (badge)
@@ -10,13 +10,17 @@ Endpoints del módulo I. Notificaciones:
 - POST   /api/v1/notificaciones/{id}/no-leer           → marcar una como no leída
 - DELETE /api/v1/notificaciones/{id}                   → eliminar una
 - DELETE /api/v1/notificaciones/leidas                 → limpiar todas las leídas
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession; ids de ruta
+PydanticObjectId; errores de dominio del service traducidos a HTTP por
+app/core/exceptions.py. Ruta estática /contador y /leidas ANTES de las
+dinámicas /{id} (igual que el Ciclo 1).
 """
 
-from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
+from fastapi import APIRouter, Depends, Query
 
 from app.core.dependencies import get_current_active_user
-from app.database import get_db
 from app.models.usuario import Usuario
 from app.schemas.notificacion_schema import (
     ContadorNoLeidasResponse,
@@ -41,9 +45,8 @@ async def listar_notificaciones(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = NotificacionService(db)
+    service = NotificacionService()
     return await service.listar(
         current_user.id,
         solo_no_leidas=solo_no_leidas,
@@ -59,9 +62,8 @@ async def listar_notificaciones(
 )
 async def contador_no_leidas(
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ContadorNoLeidasResponse:
-    service = NotificacionService(db)
+    service = NotificacionService()
     return await service.contar_no_leidas(current_user.id)
 
 
@@ -74,11 +76,10 @@ async def contador_no_leidas(
     summary="Obtener una notificación",
 )
 async def obtener_notificacion(
-    notificacion_id: int,
+    notificacion_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> NotificacionResponse:
-    service = NotificacionService(db)
+    service = NotificacionService()
     return await service.obtener(
         notificacion_id, usuario_id=current_user.id
     )
@@ -93,15 +94,14 @@ async def obtener_notificacion(
     summary="Marcar varias (o todas) notificaciones como leídas",
     description=(
         "Si `todas=True`, marca todas las no leídas. Si no, marca solo las "
-        "de la lista `ids`. Devuelve el número de filas actualizadas."
+        "de la lista `ids`. Devuelve el número de documentos actualizados."
     ),
 )
 async def marcar_leidas(
     datos: MarcarNotificacionesLeidasRequest,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> dict:
-    service = NotificacionService(db)
+    service = NotificacionService()
     total = await service.marcar_varias_leidas(
         current_user.id, ids=datos.ids, todas=datos.todas
     )
@@ -114,11 +114,10 @@ async def marcar_leidas(
     summary="Marcar una notificación como leída",
 )
 async def marcar_leida(
-    notificacion_id: int,
+    notificacion_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> NotificacionResponse:
-    service = NotificacionService(db)
+    service = NotificacionService()
     return await service.marcar_leida(
         notificacion_id, usuario_id=current_user.id, leida=True
     )
@@ -130,11 +129,10 @@ async def marcar_leida(
     summary="Marcar una notificación como no leída",
 )
 async def marcar_no_leida(
-    notificacion_id: int,
+    notificacion_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> NotificacionResponse:
-    service = NotificacionService(db)
+    service = NotificacionService()
     return await service.marcar_leida(
         notificacion_id, usuario_id=current_user.id, leida=False
     )
@@ -150,22 +148,20 @@ async def marcar_no_leida(
 )
 async def limpiar_leidas(
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> dict:
-    service = NotificacionService(db)
+    service = NotificacionService()
     eliminadas = await service.limpiar_leidas(current_user.id)
     return {"eliminadas": eliminadas}
 
 
 @router.delete(
     "/{notificacion_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
+    status_code=204,
     summary="Eliminar una notificación",
 )
 async def eliminar_notificacion(
-    notificacion_id: int,
+    notificacion_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> None:
-    service = NotificacionService(db)
+    service = NotificacionService()
     await service.eliminar(notificacion_id, usuario_id=current_user.id)

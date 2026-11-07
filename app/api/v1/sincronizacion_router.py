@@ -1,17 +1,22 @@
 # app/api/v1/sincronizacion_router.py
 """
-Endpoints del módulo H. Sincronización Móvil/Web Offline:
+Endpoints del módulo H. Sincronización Móvil/Web Offline — CICLO 2.
 
 - POST /api/v1/sincronizacion/batch                          → enviar lote offline
 - GET  /api/v1/sincronizacion/diagramas/{id}/conflictos      → listar conflictos pendientes
 - POST /api/v1/sincronizacion/conflictos/{id}/resolver       → resolver conflicto
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession (el service se
+instanciar sin sesión; la conexión la lleva Beanie) y los ids de ruta son
+PydanticObjectId (str de ObjectId en el JSON). Los errores de dominio que
+lanza el service (NotFoundError/ValidationError/ForbiddenError) los
+traduce a HTTP el manejador de app/core/exceptions.py.
 """
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_current_active_user
-from app.database import get_db
 from app.models.usuario import Usuario
 from app.schemas.sincronizacion_schema import (
     BatchSincronizacionRequest,
@@ -41,9 +46,8 @@ router = APIRouter()
 async def enviar_batch(
     datos: BatchSincronizacionRequest,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> BatchSincronizacionResponse:
-    service = SincronizacionService(db)
+    service = SincronizacionService()
     return await service.procesar_batch(datos, usuario_id=current_user.id)
 
 
@@ -60,11 +64,10 @@ async def enviar_batch(
     ),
 )
 async def listar_conflictos(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = SincronizacionService(db)
+    service = SincronizacionService()
     return await service.listar_conflictos(
         diagrama_id, usuario_id=current_user.id
     )
@@ -82,12 +85,11 @@ async def listar_conflictos(
     ),
 )
 async def resolver_conflicto(
-    conflicto_id: int,
+    conflicto_id: PydanticObjectId,
     datos: ResolverConflictoRequest,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ConflictoSyncResponse:
-    service = SincronizacionService(db)
+    service = SincronizacionService()
     return await service.resolver_conflicto(
         conflicto_id,
         estrategia=datos.estrategia,

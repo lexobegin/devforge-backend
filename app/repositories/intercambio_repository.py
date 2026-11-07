@@ -1,15 +1,27 @@
 # app/repositories/intercambio_repository.py
 """
-Repositorio de acceso a datos del módulo E. Intercambio de Modelos (XMI/XML):
+Repositorio de acceso a datos del módulo E. Intercambio de Modelos
+(XMI/XML) — CICLO 2.
 
-- ExportacionRepository → tabla `exportaciones_diagrama`
-- ImportacionRepository → tabla `importaciones_diagrama`
+- ExportacionRepository → colección `exportaciones_diagrama`
+- ImportacionRepository → colección `importaciones_diagrama`
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Ya no recibe AsyncSession: repositorios SIN ESTADO (la conexión la lleva
+  Beanie tras app/mongo.init_db()).
+- Las 2 colecciones se conservan SEPARADAS (mismo criterio que los
+  modelos: son bitácoras que crecen linealmente con el uso; embeberlas
+  haría crecer el Diagrama sin límite).
+- ids int → PydanticObjectId (ObjectId de Mongo).
+- flush/refresh → insert()/save()/delete() de Beanie.
+- En el Ciclo 2 estos registros documentan el round-trip DevForge ↔
+  Enterprise Architect: el conversor XMI (lxml) llama a
+  actualizar_estado con EXITOSO/FALLIDO al terminar cada operación.
 """
 
 from typing import Optional, Sequence
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.models.intercambio import ExportacionDiagrama, ImportacionDiagrama
 
@@ -18,123 +30,113 @@ from app.models.intercambio import ExportacionDiagrama, ImportacionDiagrama
 # ExportacionRepository
 # ======================================================================
 class ExportacionRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
-    async def get_by_id(self, exportacion_id: int) -> Optional[ExportacionDiagrama]:
-        result = await self.db.execute(
-            select(ExportacionDiagrama).where(
-                ExportacionDiagrama.id == exportacion_id
-            )
-        )
-        return result.scalar_one_or_none()
+    async def get_by_id(
+        self, exportacion_id: PydanticObjectId
+    ) -> Optional[ExportacionDiagrama]:
+        return await ExportacionDiagrama.get(exportacion_id)
 
     async def list_by_diagrama(
         self,
-        diagrama_id: int,
+        diagrama_id: PydanticObjectId,
         *,
         skip: int = 0,
         limit: int = 50,
     ) -> Sequence[ExportacionDiagrama]:
-        result = await self.db.execute(
-            select(ExportacionDiagrama)
-            .where(ExportacionDiagrama.id_diagrama == diagrama_id)
-            .order_by(ExportacionDiagrama.exported_at.desc())
-            .offset(skip)
+        return await (
+            ExportacionDiagrama.find(
+                ExportacionDiagrama.id_diagrama == diagrama_id
+            )
+            .sort(-ExportacionDiagrama.exported_at)
+            .skip(skip)
             .limit(limit)
+            .to_list()
         )
-        return result.scalars().all()
 
     async def list_by_usuario(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         skip: int = 0,
         limit: int = 50,
     ) -> Sequence[ExportacionDiagrama]:
-        result = await self.db.execute(
-            select(ExportacionDiagrama)
-            .where(ExportacionDiagrama.id_usuario == usuario_id)
-            .order_by(ExportacionDiagrama.exported_at.desc())
-            .offset(skip)
-            .limit(limit)
-        )
-        return result.scalars().all()
-
-    async def count_by_diagrama(self, diagrama_id: int) -> int:
-        result = await self.db.execute(
-            select(func.count(ExportacionDiagrama.id)).where(
-                ExportacionDiagrama.id_diagrama == diagrama_id
+        return await (
+            ExportacionDiagrama.find(
+                ExportacionDiagrama.id_usuario == usuario_id
             )
+            .sort(-ExportacionDiagrama.exported_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
         )
-        return int(result.scalar_one())
+
+    async def count_by_diagrama(
+        self, diagrama_id: PydanticObjectId
+    ) -> int:
+        return await ExportacionDiagrama.find(
+            ExportacionDiagrama.id_diagrama == diagrama_id
+        ).count()
 
     # ------------------------------------------------------------------
     # Escrituras
     # ------------------------------------------------------------------
-    async def create(self, exportacion: ExportacionDiagrama) -> ExportacionDiagrama:
-        self.db.add(exportacion)
-        await self.db.flush()
-        await self.db.refresh(exportacion)
+    async def create(
+        self, exportacion: ExportacionDiagrama
+    ) -> ExportacionDiagrama:
+        await exportacion.insert()
         return exportacion
 
     async def delete(self, exportacion: ExportacionDiagrama) -> None:
-        await self.db.delete(exportacion)
-        await self.db.flush()
+        await exportacion.delete()
 
 
 # ======================================================================
 # ImportacionRepository
 # ======================================================================
 class ImportacionRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
-    async def get_by_id(self, importacion_id: int) -> Optional[ImportacionDiagrama]:
-        result = await self.db.execute(
-            select(ImportacionDiagrama).where(
-                ImportacionDiagrama.id == importacion_id
-            )
-        )
-        return result.scalar_one_or_none()
+    async def get_by_id(
+        self, importacion_id: PydanticObjectId
+    ) -> Optional[ImportacionDiagrama]:
+        return await ImportacionDiagrama.get(importacion_id)
 
     async def list_by_diagrama(
         self,
-        diagrama_id: int,
+        diagrama_id: PydanticObjectId,
         *,
         skip: int = 0,
         limit: int = 50,
     ) -> Sequence[ImportacionDiagrama]:
-        result = await self.db.execute(
-            select(ImportacionDiagrama)
-            .where(ImportacionDiagrama.id_diagrama == diagrama_id)
-            .order_by(ImportacionDiagrama.imported_at.desc())
-            .offset(skip)
+        return await (
+            ImportacionDiagrama.find(
+                ImportacionDiagrama.id_diagrama == diagrama_id
+            )
+            .sort(-ImportacionDiagrama.imported_at)
+            .skip(skip)
             .limit(limit)
+            .to_list()
         )
-        return result.scalars().all()
 
     async def list_by_usuario(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         skip: int = 0,
         limit: int = 50,
     ) -> Sequence[ImportacionDiagrama]:
-        result = await self.db.execute(
-            select(ImportacionDiagrama)
-            .where(ImportacionDiagrama.id_usuario == usuario_id)
-            .order_by(ImportacionDiagrama.imported_at.desc())
-            .offset(skip)
+        return await (
+            ImportacionDiagrama.find(
+                ImportacionDiagrama.id_usuario == usuario_id
+            )
+            .sort(-ImportacionDiagrama.imported_at)
+            .skip(skip)
             .limit(limit)
+            .to_list()
         )
-        return result.scalars().all()
 
     async def list_by_estado(
         self,
@@ -147,48 +149,45 @@ class ImportacionRepository:
         Útil para reintentar importaciones fallidas o para monitoreo
         de las que están en PENDIENTE.
         """
-        result = await self.db.execute(
-            select(ImportacionDiagrama)
-            .where(ImportacionDiagrama.estado == estado)
-            .order_by(ImportacionDiagrama.imported_at.desc())
-            .offset(skip)
+        return await (
+            ImportacionDiagrama.find(ImportacionDiagrama.estado == estado)
+            .sort(-ImportacionDiagrama.imported_at)
+            .skip(skip)
             .limit(limit)
+            .to_list()
         )
-        return result.scalars().all()
 
-    async def count_by_diagrama(self, diagrama_id: int) -> int:
-        result = await self.db.execute(
-            select(func.count(ImportacionDiagrama.id)).where(
-                ImportacionDiagrama.id_diagrama == diagrama_id
-            )
-        )
-        return int(result.scalar_one())
+    async def count_by_diagrama(
+        self, diagrama_id: PydanticObjectId
+    ) -> int:
+        return await ImportacionDiagrama.find(
+            ImportacionDiagrama.id_diagrama == diagrama_id
+        ).count()
 
     # ------------------------------------------------------------------
     # Escrituras
     # ------------------------------------------------------------------
-    async def create(self, importacion: ImportacionDiagrama) -> ImportacionDiagrama:
-        self.db.add(importacion)
-        await self.db.flush()
-        await self.db.refresh(importacion)
+    async def create(
+        self, importacion: ImportacionDiagrama
+    ) -> ImportacionDiagrama:
+        await importacion.insert()
         return importacion
 
-    async def update(self, importacion: ImportacionDiagrama) -> ImportacionDiagrama:
-        await self.db.flush()
-        await self.db.refresh(importacion)
+    async def update(
+        self, importacion: ImportacionDiagrama
+    ) -> ImportacionDiagrama:
+        await importacion.save()
         return importacion
 
     async def actualizar_estado(
-        self, importacion_id: int, estado: str
+        self, importacion_id: PydanticObjectId, estado: str
     ) -> Optional[ImportacionDiagrama]:
         importacion = await self.get_by_id(importacion_id)
         if importacion is None:
             return None
         importacion.estado = estado
-        await self.db.flush()
-        await self.db.refresh(importacion)
+        await importacion.save()
         return importacion
 
     async def delete(self, importacion: ImportacionDiagrama) -> None:
-        await self.db.delete(importacion)
-        await self.db.flush()
+        await importacion.delete()

@@ -3,15 +3,31 @@
 Repositorio de acceso a datos del módulo B. Proyectos y Miembros.
 
 Incluye dos repositorios:
-- ProyectoRepository          → tabla `proyectos`
-- MiembroProyectoRepository   → tabla `miembros_proyecto`
+- ProyectoRepository          → colección `proyectos`
+- MiembroProyectoRepository   → miembros EMBEBIDOS en Proyecto.miembros
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Ya no recibe AsyncSession: repositorios SIN ESTADO (la conexión la lleva
+  Beanie tras app/mongo.init_db()).
+- La tabla miembros_proyecto desapareció: cada miembro va EMBEBIDO en su
+  proyecto. Consecuencias en MiembroProyectoRepository:
+    * Los miembros ya NO tienen id propio: la clave es el par
+      (proyecto, id_usuario); get_by_id se retira.
+    * Toda ESCRITURA recibe el DOCUMENTO Proyecto re-leído de la base,
+      modifica su lista `miembros` y lo guarda (regla fetch→modificar→save
+      de Beanie: en MongoDB no hay INSERT sobre una "tabla hija").
+    * get_by_id(con_miembros=True) ya no necesita selectinload: leer el
+      proyecto SIEMPRE trae sus miembros (el parámetro se retiró).
+- list_for_usuario/count_for_usuario ya no hacen JOIN: MongoDB filtra
+  directamente por el campo del embebido (miembros.id_usuario), y el
+  DISTINCT del Ciclo 1 sobra (cada proyecto aparece una sola vez).
+- La unicidad (id_proyecto, id_usuario) del uq_miembro del Ciclo 1 la
+  verifica el SERVICIO con Proyecto.miembro(...) antes de insertar.
 """
 
 from typing import Optional, Sequence
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from beanie import PydanticObjectId
 
 from app.models.proyecto import MiembroProyecto, Proyecto
 
@@ -20,65 +36,50 @@ from app.models.proyecto import MiembroProyecto, Proyecto
 # ProyectoRepository
 # ======================================================================
 class ProyectoRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
     async def get_by_id(
-        self,
-        proyecto_id: int,
-        *,
-        con_miembros: bool = False,
+        self, proyecto_id: PydanticObjectId
     ) -> Optional[Proyecto]:
-        stmt = select(Proyecto).where(Proyecto.id == proyecto_id)
-        if con_miembros:
-            stmt = stmt.options(selectinload(Proyecto.miembros))
-        result = await self.db.execute(stmt)
-        return result.scalar_one_or_none()
+        """Los miembros SIEMPRE vienen embebidos (antes con_miembros=True)."""
+        return await Proyecto.get(proyecto_id)
 
     async def list_for_usuario(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         skip: int = 0,
         limit: int = 50,
         incluir_archivados: bool = False,
     ) -> Sequence[Proyecto]:
         """
-        Proyectos en los que el usuario participa (como propietario o miembro),
-        ordenados por fecha de actualización descendente.
+        Proyectos en los que el usuario participa (como propietario o
+        miembro), ordenados por fecha de actualización descendente.
+        El filtro sobre el embebido (miembros.id_usuario) sustituye al
+        JOIN con miembros_proyecto del Ciclo 1.
         """
-        stmt = (
-            select(Proyecto)
-            .join(MiembroProyecto, MiembroProyecto.id_proyecto == Proyecto.id)
-            .where(MiembroProyecto.id_usuario == usuario_id)
-            .order_by(Proyecto.updated_at.desc())
-            .offset(skip)
-            .limit(limit)
-        )
+        condiciones = [Proyecto.miembros.id_usuario == usuario_id]
         if not incluir_archivados:
-            stmt = stmt.where(Proyecto.estado == "ACTIVO")
-        result = await self.db.execute(stmt)
-        return result.scalars().unique().all()
+            condiciones.append(Proyecto.estado == "ACTIVO")
+        return await (
+            Proyecto.find(*condiciones)
+            .sort(-Proyecto.updated_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
+        )
 
     async def count_for_usuario(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         incluir_archivados: bool = False,
     ) -> int:
-        stmt = (
-            select(func.count(func.distinct(Proyecto.id)))
-            .select_from(Proyecto)
-            .join(MiembroProyecto, MiembroProyecto.id_proyecto == Proyecto.id)
-            .where(MiembroProyecto.id_usuario == usuario_id)
-        )
+        condiciones = [Proyecto.miembros.id_usuario == usuario_id]
         if not incluir_archivados:
-            stmt = stmt.where(Proyecto.estado == "ACTIVO")
-        result = await self.db.execute(stmt)
-        return int(result.scalar_one())
+            condiciones.append(Proyecto.estado == "ACTIVO")
+        return await Proyecto.find(*condiciones).count()
 
     async def list_all(
         self,
@@ -88,129 +89,166 @@ class ProyectoRepository:
         incluir_archivados: bool = False,
     ) -> Sequence[Proyecto]:
         """Uso administrativo: todos los proyectos de la plataforma."""
-        stmt = select(Proyecto).order_by(Proyecto.updated_at.desc())
+        condiciones = []
         if not incluir_archivados:
-            stmt = stmt.where(Proyecto.estado == "ACTIVO")
-        stmt = stmt.offset(skip).limit(limit)
-        result = await self.db.execute(stmt)
-        return result.scalars().all()
+            condiciones.append(Proyecto.estado == "ACTIVO")
+        return await (
+            Proyecto.find(*condiciones)
+            .sort(-Proyecto.updated_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
+        )
 
     # ------------------------------------------------------------------
     # Escrituras
     # ------------------------------------------------------------------
     async def create(self, proyecto: Proyecto) -> Proyecto:
-        self.db.add(proyecto)
-        await self.db.flush()
-        await self.db.refresh(proyecto)
+        await proyecto.insert()
         return proyecto
 
     async def update(self, proyecto: Proyecto) -> Proyecto:
-        await self.db.flush()
-        await self.db.refresh(proyecto)
+        await proyecto.save()
         return proyecto
 
     async def delete(self, proyecto: Proyecto) -> None:
-        await self.db.delete(proyecto)
-        await self.db.flush()
+        await proyecto.delete()
 
-    async def archivar(self, proyecto_id: int) -> Optional[Proyecto]:
+    async def archivar(
+        self, proyecto_id: PydanticObjectId
+    ) -> Optional[Proyecto]:
         proyecto = await self.get_by_id(proyecto_id)
         if proyecto is None:
             return None
         proyecto.estado = "ARCHIVADO"
-        await self.db.flush()
-        await self.db.refresh(proyecto)
+        await proyecto.save()
         return proyecto
 
-    async def activar(self, proyecto_id: int) -> Optional[Proyecto]:
+    async def activar(
+        self, proyecto_id: PydanticObjectId
+    ) -> Optional[Proyecto]:
         proyecto = await self.get_by_id(proyecto_id)
         if proyecto is None:
             return None
         proyecto.estado = "ACTIVO"
-        await self.db.flush()
-        await self.db.refresh(proyecto)
+        await proyecto.save()
         return proyecto
 
 
 # ======================================================================
-# MiembroProyectoRepository
+# MiembroProyectoRepository (embebidos en Proyecto.miembros)
 # ======================================================================
 class MiembroProyectoRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
+    """
+    Operaciones sobre los miembros EMBEBIDOS de un proyecto.
+
+    En el Ciclo 1 cada método recibía/devolvía filas de miembros_proyecto;
+    en el Ciclo 2 la unidad de persistencia es el PROYECTO: los métodos de
+    escritura reciben el documento Proyecto re-leído de la base, modifican
+    su lista `miembros` y lo guardan. Si el servicio pasa un Proyecto viejo
+    en memoria (no re-leído) Beanie puede sobrescribir cambios ajenos.
+    """
 
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
-    async def get_by_id(self, miembro_id: int) -> Optional[MiembroProyecto]:
-        result = await self.db.execute(
-            select(MiembroProyecto).where(MiembroProyecto.id == miembro_id)
-        )
-        return result.scalar_one_or_none()
-
     async def get_by_proyecto_usuario(
-        self, proyecto_id: int, usuario_id: int
+        self,
+        proyecto_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
     ) -> Optional[MiembroProyecto]:
-        result = await self.db.execute(
-            select(MiembroProyecto).where(
-                MiembroProyecto.id_proyecto == proyecto_id,
-                MiembroProyecto.id_usuario == usuario_id,
-            )
-        )
-        return result.scalar_one_or_none()
+        proyecto = await Proyecto.get(proyecto_id)
+        if proyecto is None:
+            return None
+        return proyecto.miembro(usuario_id)
 
     async def list_by_proyecto(
-        self, proyecto_id: int
+        self, proyecto_id: PydanticObjectId
     ) -> Sequence[MiembroProyecto]:
-        result = await self.db.execute(
-            select(MiembroProyecto)
-            .where(MiembroProyecto.id_proyecto == proyecto_id)
-            .order_by(MiembroProyecto.joined_at.asc())
-        )
-        return result.scalars().all()
+        proyecto = await Proyecto.get(proyecto_id)
+        if proyecto is None:
+            return []
+        return sorted(proyecto.miembros, key=lambda m: m.joined_at)
 
     async def list_by_usuario(
-        self, usuario_id: int
-    ) -> Sequence[MiembroProyecto]:
-        result = await self.db.execute(
-            select(MiembroProyecto).where(MiembroProyecto.id_usuario == usuario_id)
-        )
-        return result.scalars().all()
+        self, usuario_id: PydanticObjectId
+    ) -> list[tuple[Proyecto, MiembroProyecto]]:
+        """
+        Membresías del usuario en TODOS los proyectos. En el Ciclo 1
+        devolvía filas sueltas con la FK; como el embebido no conoce a su
+        padre, se devuelve el PAR (proyecto, membresía) para que el servicio
+        sepa en qué proyecto es miembro.
+        """
+        proyectos = await Proyecto.find(
+            Proyecto.miembros.id_usuario == usuario_id
+        ).to_list()
+        pares: list[tuple[Proyecto, MiembroProyecto]] = []
+        for proyecto in proyectos:
+            miembro = proyecto.miembro(usuario_id)
+            if miembro is not None:
+                pares.append((proyecto, miembro))
+        return pares
 
-    async def count_propietarios(self, proyecto_id: int) -> int:
+    async def count_propietarios(
+        self, proyecto_id: PydanticObjectId
+    ) -> int:
         """Cuenta cuántos PROPIETARIO tiene un proyecto (para no dejar 0)."""
-        result = await self.db.execute(
-            select(func.count(MiembroProyecto.id)).where(
-                MiembroProyecto.id_proyecto == proyecto_id,
-                MiembroProyecto.rol_en_proyecto == "PROPIETARIO",
-            )
+        proyecto = await Proyecto.get(proyecto_id)
+        if proyecto is None:
+            return 0
+        return sum(
+            1
+            for m in proyecto.miembros
+            if m.rol_en_proyecto == "PROPIETARIO"
         )
-        return int(result.scalar_one())
 
     # ------------------------------------------------------------------
-    # Escrituras
+    # Escrituras (reciben el Proyecto re-leído y lo persisten)
     # ------------------------------------------------------------------
-    async def create(self, miembro: MiembroProyecto) -> MiembroProyecto:
-        self.db.add(miembro)
-        await self.db.flush()
-        await self.db.refresh(miembro)
+    async def create(
+        self, proyecto: Proyecto, miembro: MiembroProyecto
+    ) -> MiembroProyecto:
+        """
+        Agrega el miembro al proyecto y persiste. La unicidad
+        (id_proyecto, id_usuario) la verificó el servicio ANTES con
+        Proyecto.miembro(id_usuario) (equivale al uq_miembro del Ciclo 1).
+        """
+        proyecto.miembros.append(miembro)
+        await proyecto.save()
         return miembro
 
-    async def update(self, miembro: MiembroProyecto) -> MiembroProyecto:
-        await self.db.flush()
-        await self.db.refresh(miembro)
+    async def update(
+        self, proyecto: Proyecto, miembro: MiembroProyecto
+    ) -> MiembroProyecto:
+        await proyecto.save()
         return miembro
 
-    async def delete(self, miembro: MiembroProyecto) -> None:
-        await self.db.delete(miembro)
-        await self.db.flush()
+    async def delete(
+        self, proyecto: Proyecto, miembro: MiembroProyecto
+    ) -> None:
+        # Se filtra por id_usuario (clave única) y no por igualdad de
+        # objetos: pydantic compara por valores y podría borrar otro
+        # miembro idéntico.
+        proyecto.miembros = [
+            m
+            for m in proyecto.miembros
+            if m.id_usuario != miembro.id_usuario
+        ]
+        await proyecto.save()
 
     async def delete_by_proyecto_usuario(
-        self, proyecto_id: int, usuario_id: int
+        self,
+        proyecto_id: PydanticObjectId,
+        usuario_id: PydanticObjectId,
     ) -> bool:
-        miembro = await self.get_by_proyecto_usuario(proyecto_id, usuario_id)
+        proyecto = await Proyecto.get(proyecto_id)
+        if proyecto is None:
+            return False
+        miembro = proyecto.miembro(usuario_id)
         if miembro is None:
             return False
-        await self.db.delete(miembro)
-        await self.db.flush()
+        proyecto.miembros = [
+            m for m in proyecto.miembros if m.id_usuario != usuario_id
+        ]
+        await proyecto.save()
         return True

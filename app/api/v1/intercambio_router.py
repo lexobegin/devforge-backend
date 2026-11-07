@@ -1,6 +1,6 @@
 # app/api/v1/intercambio_router.py
 """
-Endpoints del módulo E. Intercambio de Modelos (XMI/XML):
+Endpoints del módulo E. Intercambio de Modelos (XMI/XML) — CICLO 2.
 
 - POST   /api/v1/intercambio/diagramas/{id}/exportar         → exportar a XMI/XML
 - GET    /api/v1/intercambio/diagramas/{id}/exportaciones    → historial de exportaciones
@@ -11,18 +11,23 @@ Endpoints del módulo E. Intercambio de Modelos (XMI/XML):
 El endpoint de importación recibe `UploadFile` (multipart/form-data) y lee
 el contenido como texto. El endpoint de exportación devuelve el registro
 + URL de descarga.
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession; ids de ruta
+PydanticObjectId; la bitácora (log_exportacion/log_importacion) se
+registra sin commit=True (insert autónomo); app/utils/xmi_converter.py
+SE CONSERVA en la VM: es el que hace la conversión y el intercambio_service
+(Tanda 13) lo importa directo.
 """
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from beanie import PydanticObjectId
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.dependencies import get_current_active_user
 from app.core.exceptions import BadRequestError, NotFoundError
-from app.database import get_db
 from app.models.usuario import Usuario
 from app.schemas.intercambio_schema import (
     ExportacionDiagramaResponse,
@@ -50,20 +55,19 @@ router = APIRouter()
     ),
 )
 async def exportar_diagrama(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     formato: str = Query("XMI", pattern="^(XMI|XML|EA|xmi|xml|ea)$"),
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ExportacionResultado:
-    service = IntercambioService(db)
+    service = IntercambioService()
     resultado = await service.exportar_diagrama(
         diagrama_id, usuario_id=current_user.id, formato=formato
     )
 
-    # Bitácora
-    auditoria = AuditoriaService(db)
+    # Bitácora (insert autónomo, como el commit=True del Ciclo 1)
+    auditoria = AuditoriaService()
     await auditoria.log_exportacion(
-        resultado.exportacion.id, diagrama_id, current_user.id, commit=True
+        resultado.exportacion.id, diagrama_id, current_user.id
     )
 
     return resultado
@@ -75,13 +79,12 @@ async def exportar_diagrama(
     summary="Listar exportaciones de un diagrama",
 )
 async def listar_exportaciones(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = IntercambioService(db)
+    service = IntercambioService()
     return await service.listar_exportaciones(
         diagrama_id, usuario_id=current_user.id, skip=skip, limit=limit
     )
@@ -102,11 +105,10 @@ async def listar_exportaciones(
     ),
 )
 async def importar_diagrama(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     archivo: UploadFile = File(..., description="Archivo XMI/XML"),
     formato: str = Form("XMI", description="'XMI' o 'XML'"),
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> ImportacionResultado:
     # Validaciones básicas del archivo
     if not archivo.filename:
@@ -126,13 +128,6 @@ async def importar_diagrama(
             f"({settings.MAX_UPLOAD_SIZE_MB} MB)"
         )
 
-    #try:
-    #    contenido_texto = _decodificar_xml(contenido_bytes)
-    #except UnicodeDecodeError:
-    #    raise BadRequestError(
-    #        "El archivo debe estar codificado en UTF-8"
-    #    )
-
     contenido_texto = _decodificar_xml(contenido_bytes)
 
     datos = ImportacionDiagramaCreate(
@@ -140,7 +135,7 @@ async def importar_diagrama(
         archivo_origen=archivo.filename,
     )
 
-    service = IntercambioService(db)
+    service = IntercambioService()
     resultado = await service.importar_diagrama(
         diagrama_id,
         datos,
@@ -149,9 +144,9 @@ async def importar_diagrama(
     )
 
     # Bitácora
-    auditoria = AuditoriaService(db)
+    auditoria = AuditoriaService()
     await auditoria.log_importacion(
-        resultado.importacion.id, diagrama_id, current_user.id, commit=True
+        resultado.importacion.id, diagrama_id, current_user.id
     )
 
     return resultado
@@ -163,13 +158,12 @@ async def importar_diagrama(
     summary="Listar importaciones de un diagrama",
 )
 async def listar_importaciones(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = IntercambioService(db)
+    service = IntercambioService()
     return await service.listar_importaciones(
         diagrama_id, usuario_id=current_user.id, skip=skip, limit=limit
     )
@@ -198,10 +192,7 @@ async def descargar_exportado(
     try:
         ruta_abs.relative_to(base)
     except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Ruta inválida",
-        )
+        raise BadRequestError("Ruta inválida")
 
     if not ruta_abs.is_file():
         raise NotFoundError("Archivo no encontrado")
@@ -211,6 +202,7 @@ async def descargar_exportado(
         filename=ruta_abs.name,
         media_type="application/xml",
     )
+
 
 def _decodificar_xml(contenido: bytes) -> str:
     """

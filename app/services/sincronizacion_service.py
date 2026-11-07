@@ -14,12 +14,48 @@ Estrategia:
 - Los cambios vienen en `BatchSincronizacionRequest` con `id_temporal_local`.
 - El backend procesa en orden FIFO (mismo orden en que se hicieron offline).
 - El resultado mapea id_temporal_local → id real (o marca conflicto).
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Servicio SIN ESTADO: sin AsyncSession ni commit()/refresh(). Cada
+  create()/save()/marcar_*() del repositorio persiste de inmediato. En el
+  Ciclo 1 el batch consolidaba TODO en un db.commit() final (una
+  transacción); en el Ciclo 2 cada cambio queda escrito en su momento:
+  si un ítem del batch falla, los anteriores YA están aplicados (el
+  cliente los ve en el mapeo id_temporal_local → id_real y no los
+  reenvía: la idempotencia por id_dispositivo + id_temporal_local
+  sustituye a la transacción).
+- Ids: usuario_id/diagrama_id/conflicto_id pasan de int a
+  PydanticObjectId. DENTRO del payload el formato también cambia:
+  id_diagrama es el str del ObjectId del diagrama, y los ids de
+  elementos (id_clase, id_atributo, id_relacion…) son los uuid de los
+  EMBEBIDOS del documento — exactamente los mismos que el batch devuelve
+  en ResultadoCambioSync.id_real (Optional[str]) al crearlos.
+- Los 7 elementos UML van EMBEBIDOS en el Diagrama: las operaciones
+  siguen usando los repositorios de diagrama_repository, pero con la
+  REGLA DEL MÓDULO: las escrituras reciben el Diagrama RE-LEÍDO
+  (fetch → modificar → save del padre) y el id real de un elemento es
+  su uuid, no un serial int.
+- _aplicar_cambio_offline devuelve Optional[str] (uuid del embebido o
+  str del ObjectId) donde el Ciclo 1 devolvía int.
+- updated_at se fija en el service (el onupdate de SQLAlchemy no
+  existe): toda mutación del lienzo refresca diagrama.updated_at y, si
+  toca una clase o su contenido, clase.updated_at (los embebidos
+  atributos/relaciones no llevan updated_at en el modelo del Ciclo 2).
+- Helpers de payload: _require_int desaparece (no hay ids enteros) y
+  entra _require_objectid para id_diagrama (mensaje adaptado:
+  "debe ser un id válido"); _require_str conserva sus mensajes
+  idénticos para nombre y para los uuid de elementos.
+- _require_editor/_require_propietario resuelven el miembro EMBEBIDO
+  con MiembroProyectoRepository.get_by_proyecto_usuario (mensajes
+  idénticos al Ciclo 1).
+- sesiones/participantes se siguen instanciando como en el Ciclo 1
+  (quedan para la extensión de presencias offline; sin uso todavía).
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.core.exceptions import (
     ConflictError,
@@ -27,7 +63,12 @@ from app.core.exceptions import (
     NotFoundError,
     ValidationError,
 )
-from app.models.diagrama import AtributoUML, ClaseUML, RelacionUML
+from app.models.diagrama import (
+    AtributoUML,
+    ClaseUML,
+    Diagrama,
+    RelacionUML,
+)
 from app.models.sincronizacion import ColaSincronizacionMovil
 from app.repositories.colaboracion_repository import (
     ParticipanteSesionRepository,
@@ -52,17 +93,33 @@ from app.schemas.sincronizacion_schema import (
 )
 
 
+def _ahora() -> datetime:
+    """Fecha aware para updated_at (el utcnow() naive del Ciclo 1 se
+    descarta)."""
+    return datetime.now(timezone.utc)
+
+
+def _recortar_motivo(texto: str, maximo: int = 255) -> str:
+    """Recorta el motivo de conflicto al max_length del DTO
+    ResultadoCambioSync (255). En el Ciclo 1 el detalle completo iba en un
+    JSONB sin límite; los ValidationError de pydantic pueden excederlo y el
+    ítem NO debe fallar por su propio mensaje (hallazgo del arnés)."""
+    texto = str(texto)
+    if len(texto) <= maximo:
+        return texto
+    return texto[: maximo - 1] + "…"
+
+
 class SincronizacionService:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-        self.cola = ColaSincronizacionRepository(db)
-        self.diagramas = DiagramaRepository(db)
-        self.clases = ClaseUMLRepository(db)
-        self.atributos = AtributoUMLRepository(db)
-        self.relaciones = RelacionUMLRepository(db)
-        self.miembros = MiembroProyectoRepository(db)
-        self.sesiones = SesionColaboracionRepository(db)
-        self.participantes = ParticipanteSesionRepository(db)
+    def __init__(self) -> None:
+        self.cola = ColaSincronizacionRepository()
+        self.diagramas = DiagramaRepository()
+        self.clases = ClaseUMLRepository()
+        self.atributos = AtributoUMLRepository()
+        self.relaciones = RelacionUMLRepository()
+        self.miembros = MiembroProyectoRepository()
+        self.sesiones = SesionColaboracionRepository()
+        self.participantes = ParticipanteSesionRepository()
 
     # ==================================================================
     # PROCESAMIENTO DE BATCH OFFLINE
@@ -71,7 +128,7 @@ class SincronizacionService:
         self,
         datos: BatchSincronizacionRequest,
         *,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
     ) -> BatchSincronizacionResponse:
         """
         Procesa un lote de cambios offline aplicándolos al diagrama.
@@ -102,8 +159,9 @@ class SincronizacionService:
             else:
                 total_conf += 1
 
-        await self.db.commit()
-
+        # (En el Ciclo 1 un db.commit() final consolidaba el batch en una
+        #  transacción; en el Ciclo 2 cada ítem ya quedó persistido en su
+        #  paso y la idempotencia evita duplicados si el cliente reintenta.)
         return BatchSincronizacionResponse(
             id_dispositivo=datos.id_dispositivo,
             id_diagrama=datos.id_diagrama,
@@ -118,9 +176,9 @@ class SincronizacionService:
     # ==================================================================
     async def listar_conflictos(
         self,
-        diagrama_id: int,
+        diagrama_id: PydanticObjectId,
         *,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
     ) -> list[ConflictoSyncResponse]:
         """
         Lista los conflictos pendientes de resolución manual en un diagrama.
@@ -136,11 +194,11 @@ class SincronizacionService:
 
     async def resolver_conflicto(
         self,
-        conflicto_id: int,
+        conflicto_id: PydanticObjectId,
         *,
         estrategia: str,
         payload_fusionado: Optional[dict[str, Any]] = None,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
     ) -> ConflictoSyncResponse:
         """
         El PROPIETARIO resuelve un conflicto eligiendo:
@@ -154,17 +212,24 @@ class SincronizacionService:
         if conflicto.estado != "CONFLICTO":
             raise ValidationError("El ítem no está marcado como conflicto")
 
-        diagrama = await self.diagramas.get_by_id(conflicto.id_diagrama)
+        # id_diagrama es opcional en la cola; si el ítem no está atado a
+        # un diagrama, get_by_id(None) → None y cae al 404 igual que el
+        # Ciclo 1 (la FK rota nunca existió aquí).
+        diagrama = (
+            await self.diagramas.get_by_id(conflicto.id_diagrama)
+            if conflicto.id_diagrama is not None
+            else None
+        )
         if diagrama is None:
             raise NotFoundError("Diagrama asociado no encontrado")
         await self._require_propietario(diagrama.id_proyecto, usuario_id)
 
         if estrategia == "SERVIDOR":
             # Descartar: marcamos como SINCRONIZADO sin aplicar
-            await self.cola.marcar_sincronizado(conflicto.id)
-            await self.db.commit()
-            await self.db.refresh(conflicto)
-            return ConflictoSyncResponse.model_validate(conflicto)
+            item = await self.cola.marcar_sincronizado(conflicto.id)
+            if item is None:
+                raise NotFoundError("Conflicto no encontrado")
+            return ConflictoSyncResponse.model_validate(item)
 
         if estrategia == "OFFLINE":
             # Aplicar el cambio offline tal cual
@@ -176,10 +241,10 @@ class SincronizacionService:
                 raise ConflictError(
                     f"No se pudo aplicar el cambio offline: {exc}"
                 ) from exc
-            await self.cola.marcar_sincronizado(conflicto.id)
-            await self.db.commit()
-            await self.db.refresh(conflicto)
-            return ConflictoSyncResponse.model_validate(conflicto)
+            item = await self.cola.marcar_sincronizado(conflicto.id)
+            if item is None:
+                raise NotFoundError("Conflicto no encontrado")
+            return ConflictoSyncResponse.model_validate(item)
 
         if estrategia == "FUSIONAR":
             if not payload_fusionado:
@@ -194,10 +259,10 @@ class SincronizacionService:
                 raise ConflictError(
                     f"No se pudo aplicar el payload fusionado: {exc}"
                 ) from exc
-            await self.cola.marcar_sincronizado(conflicto.id)
-            await self.db.commit()
-            await self.db.refresh(conflicto)
-            return ConflictoSyncResponse.model_validate(conflicto)
+            item = await self.cola.marcar_sincronizado(conflicto.id)
+            if item is None:
+                raise NotFoundError("Conflicto no encontrado")
+            return ConflictoSyncResponse.model_validate(item)
 
         raise ValidationError(
             "Estrategia inválida. Use 'OFFLINE', 'SERVIDOR' o 'FUSIONAR'"
@@ -211,8 +276,8 @@ class SincronizacionService:
         cambio: CambioOfflineItem,
         *,
         id_dispositivo: str,
-        id_diagrama: int,
-        usuario_id: int,
+        id_diagrama: PydanticObjectId,
+        usuario_id: PydanticObjectId,
     ) -> ResultadoCambioSync:
         """
         Procesa un ítem individual:
@@ -271,7 +336,7 @@ class SincronizacionService:
                 id_temporal_local=cambio.id_temporal_local,
                 estado="CONFLICTO",
                 id_real=None,
-                motivo_conflicto=str(exc),
+                motivo_conflicto=_recortar_motivo(str(exc)),
             )
         except Exception as exc:
             # Error inesperado: marcamos conflicto para que el PROPIETARIO revise
@@ -280,7 +345,7 @@ class SincronizacionService:
                 id_temporal_local=cambio.id_temporal_local,
                 estado="CONFLICTO",
                 id_real=None,
-                motivo_conflicto=f"Error al aplicar: {exc}",
+                motivo_conflicto=_recortar_motivo(f"Error al aplicar: {exc}"),
             )
 
         await self.cola.marcar_sincronizado(item.id)
@@ -293,10 +358,11 @@ class SincronizacionService:
 
     async def _aplicar_cambio_offline(
         self, tipo_operacion: str, payload: dict[str, Any]
-    ) -> Optional[int]:
+    ) -> Optional[str]:
         """
-        Despacha según el tipo de operación. Devuelve el id real del recurso
-        creado/modificado, o None si no aplica.
+        Despacha según el tipo de operación. Devuelve el id real (str) del
+        recurso creado/modificado — uuid del elemento EMBEBIDO o
+        str(ObjectId) —, o None si no aplica.
 
         Tipos soportados hoy:
         - CREAR_CLASE
@@ -333,9 +399,11 @@ class SincronizacionService:
 
     # ------------------------------------------------------------------
     # Operaciones individuales
+    # (Cada una re-lee el Diagrama dueño y persiste el PADRE completo:
+    #  es la misma regla fetch → modificar → save del módulo C.)
     # ------------------------------------------------------------------
-    async def _op_crear_clase(self, payload: dict[str, Any]) -> int:
-        id_diagrama = self._require_int(payload, "id_diagrama")
+    async def _op_crear_clase(self, payload: dict[str, Any]) -> str:
+        id_diagrama = self._require_objectid(payload, "id_diagrama")
         nombre = self._require_str(payload, "nombre")
 
         if await self.clases.exists_nombre_en_diagrama(id_diagrama, nombre):
@@ -343,16 +411,30 @@ class SincronizacionService:
                 f"Ya existe una clase '{nombre}' creada en el servidor"
             )
 
-        # Necesitamos id_creador: usamos el del payload o 0 (nunca 0 en BD);
-        # en la práctica el payload offline lo trae del usuario local.
+        # Necesitamos id_creador: el payload offline lo trae del usuario
+        # local (str del ObjectId en el Ciclo 2).
         id_creador = payload.get("id_creador")
         if not id_creador:
             raise _ConflictoDeEdicion(
                 "Falta id_creador en el payload de la clase offline"
             )
+        try:
+            id_creador = PydanticObjectId(id_creador)
+        except (TypeError, ValueError):
+            raise _ConflictoDeEdicion(
+                "El id_creador del payload no es un id válido"
+            )
+
+        diagrama = await self.diagramas.get_by_id(id_diagrama)
+        if diagrama is None:
+            # En el Ciclo 1 el INSERT fallaba por FK y el ítem caía a
+            # CONFLICTO vía "Error al aplicar"; aquí el mismo caso tiene
+            # un motivo explícito.
+            raise _ConflictoDeEdicion(
+                "El diagrama destino no existe en el servidor"
+            )
 
         clase = ClaseUML(
-            id_diagrama=id_diagrama,
             nombre=nombre,
             es_abstracta=bool(payload.get("es_abstracta", False)),
             estereotipo=payload.get("estereotipo"),
@@ -360,12 +442,20 @@ class SincronizacionService:
             pos_y=payload.get("pos_y", 0),
             id_creador=id_creador,
         )
-        clase = await self.clases.create(clase)
+        # El repositorio agrega la clase al documento re-leído y hace
+        # save() del padre; el uuid de la clase se genera antes del save,
+        # así que es estable como id_real.
+        clase = await self.clases.create(diagrama, clase)
         return clase.id
 
-    async def _op_modificar_clase(self, payload: dict[str, Any]) -> int:
-        clase_id = self._require_int(payload, "id_clase")
-        clase = await self.clases.get_by_id(clase_id)
+    async def _op_modificar_clase(self, payload: dict[str, Any]) -> str:
+        clase_id = self._require_str(payload, "id_clase")
+        diagrama = await self.clases.get_diagrama_de_clase(clase_id)
+        if diagrama is None:
+            raise _ConflictoDeEdicion(
+                "La clase a modificar fue eliminada en el servidor"
+            )
+        clase = diagrama.clase(clase_id)
         if clase is None:
             raise _ConflictoDeEdicion(
                 "La clase a modificar fue eliminada en el servidor"
@@ -375,7 +465,7 @@ class SincronizacionService:
         nuevo_nombre = payload.get("nombre")
         if nuevo_nombre and nuevo_nombre != clase.nombre:
             if await self.clases.exists_nombre_en_diagrama(
-                clase.id_diagrama, nuevo_nombre, exclude_id=clase.id
+                diagrama.id, nuevo_nombre, exclude_id=clase.id
             ):
                 raise _ConflictoDeEdicion(
                     f"El nombre '{nuevo_nombre}' ya está en uso en el servidor"
@@ -391,26 +481,40 @@ class SincronizacionService:
         if "pos_y" in payload:
             clase.pos_y = payload["pos_y"]
 
-        await self.clases.update(clase)
+        # (onupdate del Ciclo 1 → lo fija el service)
+        clase.updated_at = _ahora()
+        diagrama.updated_at = _ahora()
+        await self.clases.update(diagrama, clase)
         return clase.id
 
-    async def _op_eliminar_clase(self, payload: dict[str, Any]) -> Optional[int]:
-        clase_id = self._require_int(payload, "id_clase")
-        clase = await self.clases.get_by_id(clase_id)
-        if clase is None:
+    async def _op_eliminar_clase(self, payload: dict[str, Any]) -> Optional[str]:
+        clase_id = self._require_str(payload, "id_clase")
+        diagrama = await self.clases.get_diagrama_de_clase(clase_id)
+        if diagrama is None:
             # Ya fue eliminada: no es conflicto, es idempotente
             return clase_id
-        # Eliminar relaciones asociadas antes
-        await self.relaciones.delete_by_clase(clase_id)
-        await self.clases.delete(clase)
+        clase = diagrama.clase(clase_id)
+        if clase is None:
+            return clase_id
+        # Eliminar relaciones asociadas antes (mismo orden que el Ciclo 1;
+        # el repositorio guarda el padre si quitó alguna).
+        await self.relaciones.delete_by_clase(diagrama, clase_id)
+        await self.clases.delete(diagrama, clase)
+        diagrama.updated_at = _ahora()
+        await self.diagramas.update(diagrama)
         return clase_id
 
-    async def _op_agregar_atributo(self, payload: dict[str, Any]) -> int:
-        clase_id = self._require_int(payload, "id_clase")
+    async def _op_agregar_atributo(self, payload: dict[str, Any]) -> str:
+        clase_id = self._require_str(payload, "id_clase")
         nombre = self._require_str(payload, "nombre")
         tipo_dato = payload.get("tipo_dato", "String")
 
-        clase = await self.clases.get_by_id(clase_id)
+        diagrama = await self.clases.get_diagrama_de_clase(clase_id)
+        if diagrama is None:
+            raise _ConflictoDeEdicion(
+                "La clase destino del atributo no existe en el servidor"
+            )
+        clase = diagrama.clase(clase_id)
         if clase is None:
             raise _ConflictoDeEdicion(
                 "La clase destino del atributo no existe en el servidor"
@@ -418,10 +522,11 @@ class SincronizacionService:
 
         orden = payload.get("orden")
         if orden is None:
-            orden = await self.atributos.next_orden(clase_id)
+            # next_orden trabaja en memoria sobre la clase del documento
+            # re-leído (COALESCE(MAX,-1)+1 del Ciclo 1).
+            orden = await self.atributos.next_orden(clase)
 
         attr = AtributoUML(
-            id_clase=clase_id,
             nombre=nombre,
             tipo_dato=tipo_dato,
             visibilidad=payload.get("visibilidad", "-"),
@@ -429,16 +534,17 @@ class SincronizacionService:
             valor_defecto=payload.get("valor_defecto"),
             orden=orden,
         )
-        attr = await self.atributos.create(attr)
+        attr = await self.atributos.create(diagrama, clase, attr)
         return attr.id
 
-    async def _op_modificar_atributo(self, payload: dict[str, Any]) -> int:
-        atributo_id = self._require_int(payload, "id_atributo")
-        attr = await self.atributos.get_by_id(atributo_id)
-        if attr is None:
+    async def _op_modificar_atributo(self, payload: dict[str, Any]) -> str:
+        atributo_id = self._require_str(payload, "id_atributo")
+        resuelto = await self._resolver_atributo(atributo_id)
+        if resuelto is None:
             raise _ConflictoDeEdicion(
                 "El atributo a modificar fue eliminado en el servidor"
             )
+        diagrama, clase, attr = resuelto
 
         if "nombre" in payload and payload["nombre"]:
             attr.nombre = payload["nombre"]
@@ -453,26 +559,42 @@ class SincronizacionService:
         if "orden" in payload and payload["orden"] is not None:
             attr.orden = payload["orden"]
 
-        await self.atributos.update(attr)
+        clase.updated_at = _ahora()
+        diagrama.updated_at = _ahora()
+        await self.atributos.update(diagrama, attr)
         return attr.id
 
-    async def _op_eliminar_atributo(self, payload: dict[str, Any]) -> Optional[int]:
-        atributo_id = self._require_int(payload, "id_atributo")
-        attr = await self.atributos.get_by_id(atributo_id)
-        if attr is None:
+    async def _op_eliminar_atributo(
+        self, payload: dict[str, Any]
+    ) -> Optional[str]:
+        atributo_id = self._require_str(payload, "id_atributo")
+        resuelto = await self._resolver_atributo(atributo_id)
+        if resuelto is None:
+            # Ya fue eliminado: no es conflicto, es idempotente
             return atributo_id
-        await self.atributos.delete(attr)
+        diagrama, clase, attr = resuelto
+        await self.atributos.delete(diagrama, clase, attr)
+        diagrama.updated_at = _ahora()
+        await self.diagramas.update(diagrama)
         return atributo_id
 
-    async def _op_crear_relacion(self, payload: dict[str, Any]) -> int:
-        id_diagrama = self._require_int(payload, "id_diagrama")
-        origen = self._require_int(payload, "id_clase_origen")
-        destino = self._require_int(payload, "id_clase_destino")
+    async def _op_crear_relacion(self, payload: dict[str, Any]) -> str:
+        id_diagrama = self._require_objectid(payload, "id_diagrama")
+        origen = self._require_str(payload, "id_clase_origen")
+        destino = self._require_str(payload, "id_clase_destino")
         tipo = payload.get("tipo_relacion", "ASOCIACION")
 
-        # Conflicto si alguna de las clases ya no existe
-        co = await self.clases.get_by_id(origen)
-        cd = await self.clases.get_by_id(destino)
+        diagrama = await self.diagramas.get_by_id(id_diagrama)
+        if diagrama is None:
+            raise _ConflictoDeEdicion(
+                "El diagrama destino no existe en el servidor"
+            )
+
+        # Conflicto si alguna de las clases ya no existe. Con el contenido
+        # embebido no hacen falta las 2 consultas por FK del Ciclo 1: el
+        # helper del documento resuelve por uuid.
+        co = diagrama.clase(origen)
+        cd = diagrama.clase(destino)
         if co is None or cd is None:
             raise _ConflictoDeEdicion(
                 "Alguna de las clases de la relación fue eliminada en el servidor"
@@ -486,7 +608,6 @@ class SincronizacionService:
             )
 
         relacion = RelacionUML(
-            id_diagrama=id_diagrama,
             id_clase_origen=origen,
             id_clase_destino=destino,
             tipo_relacion=tipo,
@@ -496,15 +617,21 @@ class SincronizacionService:
             rol_origen=payload.get("rol_origen"),
             rol_destino=payload.get("rol_destino"),
         )
-        relacion = await self.relaciones.create(relacion)
+        relacion = await self.relaciones.create(diagrama, relacion)
         return relacion.id
 
-    async def _op_eliminar_relacion(self, payload: dict[str, Any]) -> Optional[int]:
-        relacion_id = self._require_int(payload, "id_relacion")
-        relacion = await self.relaciones.get_by_id(relacion_id)
-        if relacion is None:
+    async def _op_eliminar_relacion(
+        self, payload: dict[str, Any]
+    ) -> Optional[str]:
+        relacion_id = self._require_str(payload, "id_relacion")
+        resuelto = await self._resolver_relacion(relacion_id)
+        if resuelto is None:
+            # Ya fue eliminada: no es conflicto, es idempotente
             return relacion_id
-        await self.relaciones.delete(relacion)
+        diagrama, relacion = resuelto
+        await self.relaciones.delete(diagrama, relacion)
+        diagrama.updated_at = _ahora()
+        await self.diagramas.update(diagrama)
         return relacion_id
 
     # ------------------------------------------------------------------
@@ -523,22 +650,30 @@ class SincronizacionService:
         # compara contra el estado actual del servidor.
         return False
 
-    def _require_int(self, payload: dict[str, Any], clave: str) -> int:
+    def _require_objectid(self, payload: dict[str, Any], clave: str) -> PydanticObjectId:
+        """
+        Resuelve un id de DOCUMENTO (str del ObjectId) desde el payload.
+        (En el Ciclo 1 era _require_int: los ids de documentos ya no son
+        enteros; el mensaje se adapta a "debe ser un id válido".)
+        """
         valor = payload.get(clave)
         if valor is None:
             raise ValidationError(f"Falta el campo obligatorio '{clave}'")
         try:
-            return int(valor)
+            return PydanticObjectId(valor)
         except (TypeError, ValueError):
-            raise ValidationError(f"El campo '{clave}' debe ser un entero")
+            raise ValidationError(f"El campo '{clave}' debe ser un id válido")
 
     def _require_str(self, payload: dict[str, Any], clave: str) -> str:
+        """Campo obligatorio no vacío (nombres y uuid de embebidos)."""
         valor = payload.get(clave)
         if not valor or not str(valor).strip():
             raise ValidationError(f"Falta el campo obligatorio '{clave}'")
         return str(valor).strip()
 
-    async def _require_editor(self, proyecto_id: int, usuario_id: int) -> None:
+    async def _require_editor(
+        self, proyecto_id: PydanticObjectId, usuario_id: PydanticObjectId
+    ) -> None:
         miembro = await self.miembros.get_by_proyecto_usuario(
             proyecto_id, usuario_id
         )
@@ -549,7 +684,9 @@ class SincronizacionService:
                 "Se requiere rol EDITOR o PROPIETARIO para sincronizar cambios"
             )
 
-    async def _require_propietario(self, proyecto_id: int, usuario_id: int) -> None:
+    async def _require_propietario(
+        self, proyecto_id: PydanticObjectId, usuario_id: PydanticObjectId
+    ) -> None:
         miembro = await self.miembros.get_by_proyecto_usuario(
             proyecto_id, usuario_id
         )
@@ -559,6 +696,39 @@ class SincronizacionService:
             raise ForbiddenError(
                 "Solo el PROPIETARIO del proyecto puede resolver conflictos"
             )
+
+    # ------------------------------------------------------------------
+    # Resolvedores de embebidos (regla del módulo C): los get_by_id de los
+    # repos devuelven el elemento EN LECTURA; para escribir se necesita el
+    # DOCUMENTO padre re-leído. Son la versión de este service de los
+    # _resolver_* del diagrama_service.
+    # ------------------------------------------------------------------
+    async def _resolver_atributo(
+        self, atributo_id: str
+    ) -> Optional[tuple[Diagrama, ClaseUML, AtributoUML]]:
+        """Localiza (diagrama re-leído, clase, atributo) por el uuid del
+        atributo anidado (2 niveles)."""
+        diagrama = await Diagrama.find_one(
+            Diagrama.clases.atributos.id == atributo_id
+        )
+        if diagrama is None:
+            return None
+        for clase in diagrama.clases:
+            atributo = clase.atributo(atributo_id)
+            if atributo is not None:
+                return diagrama, clase, atributo
+        return None
+
+    async def _resolver_relacion(
+        self, relacion_id: str
+    ) -> Optional[tuple[Diagrama, RelacionUML]]:
+        """Localiza (diagrama re-leído, relación) por su uuid."""
+        diagrama = await Diagrama.find_one(
+            Diagrama.relaciones.id == relacion_id
+        )
+        if diagrama is None:
+            return None
+        return diagrama, diagrama.relacion(relacion_id)
 
 
 class _ConflictoDeEdicion(Exception):

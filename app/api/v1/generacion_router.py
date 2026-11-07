@@ -1,25 +1,39 @@
 # app/api/v1/generacion_router.py
 """
-Endpoints del módulo F. Generación Automática de Backend (Spring Boot):
+Endpoints del módulo F. Generación Automática de Backend (Spring Boot)
+— CICLO 2.
 
 - POST   /api/v1/generacion/diagramas/{id}/generar       → disparar generación
 - GET    /api/v1/generacion/trabajos/{trabajo_id}        → ver detalle
 - GET    /api/v1/generacion/trabajos/{trabajo_id}/estado → estado liviano (polling)
 - GET    /api/v1/generacion/diagramas/{id}/trabajos      → historial de trabajos
-- GET    /api/v1/generacion/trabajos/{trabajo_id}/descargar → descargar ZIP
+- GET    /api/v1/generacion/trabajos/{trabajo_id}/descargar → URL de descarga
+- GET    /api/v1/generacion/trabajos/{trabajo_id}/archivo   → descargar ZIP
+
+CICLO 2 (reconvertido del Ciclo 1, cambios documentados):
+- SIN AsyncSessionLocal ni BackgroundTasks: GeneratorService.generar_backend()
+  (Tanda 18) ejecuta el pipeline COMPLETO en la llamada (gate → mapeo →
+  render → ZIP → embebidos → EXITOSO) y devuelve el trabajo terminado;
+  por eso el POST responde 200 OK y no 202+polling. El endpoint /estado
+  se conserva por compatibilidad.
+- package_base/nombre_proyecto/incluir_postman de GenerarBackendRequest
+  se mapean directo al service (package_base va por constructor).
+- Las consultas (detalle/estado/historial) usan el TrabajoGeneracionRepository
+  sin estado + verificación de pertenencia (mismo criterio del módulo C:
+  ajeno → 404 genérico "Recurso no encontrado").
 """
 
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from beanie import PydanticObjectId
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.dependencies import get_current_active_user
-from app.core.exceptions import BadRequestError, NotFoundError
-from app.database import AsyncSessionLocal, get_db
+from app.core.exceptions import NotFoundError
 from app.models.usuario import Usuario
+from app.repositories.diagrama_repository import DiagramaRepository
 from app.repositories.generacion_repository import TrabajoGeneracionRepository
 from app.repositories.proyecto_repository import MiembroProyectoRepository
 from app.schemas.generacion_schema import (
@@ -28,9 +42,9 @@ from app.schemas.generacion_schema import (
     GenerarBackendRequest,
     TrabajoGeneracionDetalleResponse,
     TrabajoGeneracionCodigoResponse,
+    EntidadGeneradaResponse,
 )
 from app.services.auditoria_service import AuditoriaService
-from app.services.notificacion_service import NotificacionService
 
 router = APIRouter()
 
@@ -41,56 +55,52 @@ router = APIRouter()
 @router.post(
     "/diagramas/{diagrama_id}/generar",
     response_model=TrabajoGeneracionCodigoResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Disparar generación automática de backend Spring Boot",
+    summary="Generar el backend Spring Boot del diagrama",
     description=(
-        "Crea un trabajo en estado PENDIENTE y lo procesa en background. "
-        "El cliente puede consultar el estado con GET /trabajos/{id}/estado."
+        "Ciclo 2: el pipeline completo corre en la llamada (gate formal → "
+        "mapeo UML→Java/SQL → render de plantillas → ZIP → resultado "
+        "embebido) y responde con el trabajo en estado EXITOSO (o lanza el "
+        "error de dominio correspondiente). El fallo de render/escritura "
+        "deja el trabajo FALLIDO y relanza la excepción original."
     ),
 )
 async def generar_backend(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     datos: GenerarBackendRequest,
-    background_tasks: BackgroundTasks,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> TrabajoGeneracionCodigoResponse:
     # Import local para evitar dependencia circular en tiempo de import
+    # (code_generator → utils.validators → …)
     from app.code_generator.generator_service import GeneratorService
 
-    service = GeneratorService(db)
-    trabajo = await service.crear_trabajo(
-        diagrama_id, datos, usuario_id=current_user.id
+    service = GeneratorService(
+        package_base=datos.package_base,
+    )
+    trabajo = await service.generar_backend(
+        current_user.id,
+        diagrama_id,
+        incluir_postman=datos.incluir_postman,
+        nombre_proyecto=datos.nombre_proyecto,
     )
 
-    # Procesar en background con su propia sesión de BD
-    background_tasks.add_task(
-        _procesar_generacion_bg,
-        trabajo_id=trabajo.id,
-        usuario_id=current_user.id,
-    )
+    # Bitácora de trabajo creado (la de EXITOSO/FALLIDO ya la escribe el
+    # service con las firmas del Ciclo 2)
+    auditoria = AuditoriaService()
+    try:
+        await auditoria.registrar(
+            tipo_evento="GENERACION_SOLICITADA",
+            descripcion=(
+                f"Generación de backend '{datos.nombre_proyecto or diagrama_id}' "
+                f"solicitada (trabajo #{trabajo.id})"
+            ),
+            id_usuario=current_user.id,
+            entidad_afectada="TRABAJO_GENERACION",
+            id_entidad_afectada=str(trabajo.id),
+        )
+    except Exception:
+        pass  # la bitácora no bloquea la respuesta (guarda del Ciclo 2)
 
-    return trabajo
-
-
-async def _procesar_generacion_bg(trabajo_id: int, usuario_id: int) -> None:
-    """
-    Ejecuta el motor de generación en background con su propia AsyncSession.
-    Al terminar:
-      - Marca el trabajo como EXITOSO/FALLIDO.
-      - Registra en bitácora.
-      - Notifica al usuario.
-    """
-    from app.code_generator.generator_service import GeneratorService
-
-    async with AsyncSessionLocal() as db:
-        service = GeneratorService(db)
-        try:
-            await service.procesar_trabajo(trabajo_id, usuario_id=usuario_id)
-        except Exception:
-            # El propio service deja el trabajo en FALLIDO; no re-lanzamos
-            # para no romper el BackgroundTasks.
-            pass
+    return TrabajoGeneracionCodigoResponse.model_validate(trabajo)
 
 
 # ======================================================================
@@ -100,17 +110,29 @@ async def _procesar_generacion_bg(trabajo_id: int, usuario_id: int) -> None:
     "/trabajos/{trabajo_id}",
     response_model=TrabajoGeneracionDetalleResponse,
     summary="Ver detalle de un trabajo de generación",
-    description="Incluye las entidades y reglas de mapeo generadas.",
+    description="Incluye las entidades y reglas de mapeo generadas (embebidas).",
 )
 async def obtener_trabajo(
-    trabajo_id: int,
+    trabajo_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    from app.code_generator.generator_service import GeneratorService
+    trabajos = TrabajoGeneracionRepository()
+    trabajo = await trabajos.get_detalle(trabajo_id)
+    if trabajo is None:
+        raise NotFoundError("Trabajo de generación no encontrado")
 
-    service = GeneratorService(db)
-    return await service.obtener_trabajo(trabajo_id, usuario_id=current_user.id)
+    await _require_miembro_de_trabajo(trabajo, current_user)
+
+    # EntidadesGeneradas vive EMBEBIDA en el documento (entidades_generadas);
+    # el response la expone como `entidades` — se arma explícito.
+    base = TrabajoGeneracionCodigoResponse.model_validate(trabajo)
+    return TrabajoGeneracionDetalleResponse(
+        **base.model_dump(),
+        entidades=[
+            EntidadGeneradaResponse.model_validate(e)
+            for e in (trabajo.entidades_generadas or [])
+        ],
+    )
 
 
 @router.get(
@@ -122,27 +144,15 @@ async def obtener_trabajo(
     ),
 )
 async def obtener_estado(
-    trabajo_id: int,
+    trabajo_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> EstadoGeneracionResponse:
-    trabajos = TrabajoGeneracionRepository(db)
+    trabajos = TrabajoGeneracionRepository()
     trabajo = await trabajos.get_by_id(trabajo_id)
     if trabajo is None:
         raise NotFoundError("Trabajo de generación no encontrado")
 
-    # Verificar pertenencia al proyecto del diagrama
-    miembros = MiembroProyectoRepository(db)
-    from app.repositories.diagrama_repository import DiagramaRepository
-
-    diagrama = await DiagramaRepository(db).get_by_id(trabajo.id_diagrama)
-    if diagrama is None:
-        raise NotFoundError("Diagrama asociado no encontrado")
-    miembro = await miembros.get_by_proyecto_usuario(
-        diagrama.id_proyecto, current_user.id
-    )
-    if miembro is None:
-        raise NotFoundError("Recurso no encontrado")
+    await _require_miembro_de_trabajo(trabajo, current_user)
 
     return EstadoGeneracionResponse(
         id=trabajo.id,
@@ -160,18 +170,20 @@ async def obtener_estado(
     summary="Historial de trabajos de generación de un diagrama",
 )
 async def listar_trabajos(
-    diagrama_id: int,
+    diagrama_id: PydanticObjectId,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    from app.code_generator.generator_service import GeneratorService
+    await _require_miembro_de_diagrama(diagrama_id, current_user)
 
-    service = GeneratorService(db)
-    return await service.listar_trabajos(
-        diagrama_id, usuario_id=current_user.id, skip=skip, limit=limit
+    trabajos = TrabajoGeneracionRepository()
+    items = await trabajos.list_by_diagrama(
+        diagrama_id, skip=skip, limit=limit
     )
+    return [
+        TrabajoGeneracionCodigoResponse.model_validate(t) for t in items
+    ]
 
 
 # ======================================================================
@@ -187,15 +199,24 @@ async def listar_trabajos(
     ),
 )
 async def obtener_url_descarga(
-    trabajo_id: int,
+    trabajo_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ) -> DescargaProyectoResponse:
     from app.code_generator.generator_service import GeneratorService
 
-    service = GeneratorService(db)
-    return await service.obtener_url_descarga(
-        trabajo_id, usuario_id=current_user.id
+    service = GeneratorService()
+    # obtener_ruta_zip valida trabajo EXITOSO + pertenencia + archivo
+    ruta = await service.obtener_ruta_zip(trabajo_id, usuario_id=current_user.id)
+
+    trabajo = await TrabajoGeneracionRepository().get_by_id(trabajo_id)
+    return DescargaProyectoResponse(
+        id_trabajo=trabajo_id,
+        download_url=(
+            f"{settings.BACKEND_PUBLIC_URL.rstrip('/')}"
+            f"{settings.API_V1_PREFIX}/generacion/trabajos/{trabajo_id}/archivo"
+        ),
+        tamanio_bytes=ruta.stat().st_size if ruta.is_file() else None,
+        incluye_postman=bool(trabajo and trabajo.incluye_postman),
     )
 
 
@@ -205,13 +226,12 @@ async def obtener_url_descarga(
     description="Streaming directo del archivo ZIP.",
 )
 async def descargar_zip(
-    trabajo_id: int,
+    trabajo_id: PydanticObjectId,
     current_user: Usuario = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
 ):
     from app.code_generator.generator_service import GeneratorService
 
-    service = GeneratorService(db)
+    service = GeneratorService()
     ruta_abs = await service.obtener_ruta_zip(
         trabajo_id, usuario_id=current_user.id
     )
@@ -220,3 +240,29 @@ async def descargar_zip(
         filename=Path(ruta_abs).name,
         media_type="application/zip",
     )
+
+
+# ======================================================================
+# Helpers de pertenencia (mismo criterio del módulo C / Tanda 18)
+# ======================================================================
+async def _require_miembro_de_trabajo(trabajo, current_user: Usuario) -> None:
+    """Ajeno → 404 genérico (no revela trabajos de otros proyectos)."""
+    diagrama = await DiagramaRepository().get_by_id(trabajo.id_diagrama)
+    if diagrama is None:
+        raise NotFoundError("Diagrama asociado no encontrado")
+    miembro = await MiembroProyectoRepository().get_by_proyecto_usuario(
+        diagrama.id_proyecto, current_user.id
+    )
+    if miembro is None:
+        raise NotFoundError("Recurso no encontrado")
+
+
+async def _require_miembro_de_diagrama(diagrama_id, current_user: Usuario) -> None:
+    diagrama = await DiagramaRepository().get_by_id(diagrama_id)
+    if diagrama is None:
+        raise NotFoundError("Diagrama no encontrado")
+    miembro = await MiembroProyectoRepository().get_by_proyecto_usuario(
+        diagrama.id_proyecto, current_user.id
+    )
+    if miembro is None:
+        raise NotFoundError("Recurso no encontrado")

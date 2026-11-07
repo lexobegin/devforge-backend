@@ -22,6 +22,12 @@ Tareas:
 
 El resultado es tolerante: si el OCR falla, la clase igual se crea con
 el nombre genérico `ClaseN` y sin atributos.
+
+CICLO 2: archivo conservado TAL CUAL del Ciclo 1 (Python puro, sin BD).
+El dict que produce alimenta VisionReconocimientoResponse
+.diagrama_restruido (mismo formato que DiagramaCompletoResponse: el
+cliente inserta las clases por los endpoints CRUD del módulo C y
+resuelve los nombres origen/destino a ids del lienzo).
 """
 
 import logging

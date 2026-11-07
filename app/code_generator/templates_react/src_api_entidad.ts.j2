@@ -1,0 +1,36 @@
+// Generado por DevForge AI (CU24) — CRUD REST de {{ ent.nombre }}
+import type { {{ ent.nombre }} } from "../tipos/{{ ent.recurso }}";
+import { apiFetch } from "./client";
+
+const RUTA = "/{{ ent.recurso }}";
+
+export async function listar{{ ent.nombre }}(): Promise<{{ ent.nombre }}[]> {
+  return apiFetch<{{ ent.nombre }}[]>(RUTA);
+}
+
+export async function obtener{{ ent.nombre }}(id: string): Promise<{{ ent.nombre }}> {
+  return apiFetch<{{ ent.nombre }}>(`${RUTA}/${id}`);
+}
+
+export async function crear{{ ent.nombre }}(
+  datos: Omit<{{ ent.nombre }}, "id">
+): Promise<{{ ent.nombre }}> {
+  return apiFetch<{{ ent.nombre }}>(RUTA, {
+    method: "POST",
+    body: JSON.stringify(datos),
+  });
+}
+
+export async function actualizar{{ ent.nombre }}(
+  id: string,
+  cambios: Partial<{{ ent.nombre }}>
+): Promise<{{ ent.nombre }}> {
+  return apiFetch<{{ ent.nombre }}>(`${RUTA}/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(cambios),
+  });
+}
+
+export async function eliminar{{ ent.nombre }}(id: string): Promise<void> {
+  await apiFetch<void>(`${RUTA}/${id}`, { method: "DELETE" });
+}

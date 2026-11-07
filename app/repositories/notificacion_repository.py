@@ -1,96 +1,97 @@
 # app/repositories/notificacion_repository.py
 """
-Repositorio de acceso a datos del módulo I. Notificaciones:
+Repositorio de acceso a datos del módulo I. Notificaciones — CICLO 2.
 
-- NotificacionRepository → tabla `notificaciones`
+- NotificacionRepository → colección `notificaciones`
+
+Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
+- Ya no recibe AsyncSession: repositorio SIN ESTADO (la conexión la lleva
+  Beanie tras app/mongo.init_db()).
+- ids int → PydanticObjectId (ObjectId de Mongo).
+- flush/refresh → insert()/save()/delete() de Beanie.
+- bulk_create hace un bucle de insert(): Mongo no devuelve filas que
+  haya que "refrescar" como el add_all + refresh del Ciclo 1.
+- marcar_varias_leidas / marcar_todas_leidas: el UPDATE ... WHERE IN del
+  Ciclo 1 es UN update de MongoDB con la condición del usuario y
+  leida=false en la MISMA consulta (defensa contra IDs ajenos incluida).
+- delete_leidas_by_usuario usa UN delete con filtro (el rowcount del
+  Ciclo 1 es el deleted_count de Mongo).
 """
 
 from typing import Optional, Sequence
 
-from sqlalchemy import func, select, update as sa_update
-from sqlalchemy.ext.asyncio import AsyncSession
+from beanie import PydanticObjectId
 
 from app.models.notificacion import Notificacion
 
 
+# ======================================================================
+# NotificacionRepository
+# ======================================================================
 class NotificacionRepository:
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
     # ------------------------------------------------------------------
     # Lecturas
     # ------------------------------------------------------------------
-    async def get_by_id(self, notificacion_id: int) -> Optional[Notificacion]:
-        result = await self.db.execute(
-            select(Notificacion).where(Notificacion.id == notificacion_id)
-        )
-        return result.scalar_one_or_none()
+    async def get_by_id(
+        self, notificacion_id: PydanticObjectId
+    ) -> Optional[Notificacion]:
+        return await Notificacion.get(notificacion_id)
 
     async def list_by_usuario(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         *,
         solo_no_leidas: bool = False,
         skip: int = 0,
         limit: int = 50,
     ) -> Sequence[Notificacion]:
-        stmt = (
-            select(Notificacion)
-            .where(Notificacion.id_usuario == usuario_id)
-            .order_by(Notificacion.created_at.desc())
-            .offset(skip)
-            .limit(limit)
-        )
+        condiciones = [Notificacion.id_usuario == usuario_id]
         if solo_no_leidas:
-            stmt = stmt.where(Notificacion.leida.is_(False))
-        result = await self.db.execute(stmt)
-        return result.scalars().all()
+            condiciones.append(Notificacion.leida == False)  # noqa: E712
+        return await (
+            Notificacion.find(*condiciones)
+            .sort(-Notificacion.created_at)
+            .skip(skip)
+            .limit(limit)
+            .to_list()
+        )
 
     async def list_by_usuario_y_tipo(
         self,
-        usuario_id: int,
+        usuario_id: PydanticObjectId,
         tipo: str,
         *,
         skip: int = 0,
         limit: int = 50,
     ) -> Sequence[Notificacion]:
-        result = await self.db.execute(
-            select(Notificacion)
-            .where(
+        return await (
+            Notificacion.find(
                 Notificacion.id_usuario == usuario_id,
                 Notificacion.tipo == tipo,
             )
-            .order_by(Notificacion.created_at.desc())
-            .offset(skip)
+            .sort(-Notificacion.created_at)
+            .skip(skip)
             .limit(limit)
+            .to_list()
         )
-        return result.scalars().all()
 
-    async def count_no_leidas(self, usuario_id: int) -> int:
+    async def count_no_leidas(self, usuario_id: PydanticObjectId) -> int:
         """Contador para el badge del dropdown de notificaciones."""
-        result = await self.db.execute(
-            select(func.count(Notificacion.id)).where(
-                Notificacion.id_usuario == usuario_id,
-                Notificacion.leida.is_(False),
-            )
-        )
-        return int(result.scalar_one())
+        return await Notificacion.find(
+            Notificacion.id_usuario == usuario_id,
+            Notificacion.leida == False,  # noqa: E712
+        ).count()
 
-    async def count_by_usuario(self, usuario_id: int) -> int:
-        result = await self.db.execute(
-            select(func.count(Notificacion.id)).where(
-                Notificacion.id_usuario == usuario_id
-            )
-        )
-        return int(result.scalar_one())
+    async def count_by_usuario(self, usuario_id: PydanticObjectId) -> int:
+        return await Notificacion.find(
+            Notificacion.id_usuario == usuario_id
+        ).count()
 
     # ------------------------------------------------------------------
     # Escrituras
     # ------------------------------------------------------------------
     async def create(self, notificacion: Notificacion) -> Notificacion:
-        self.db.add(notificacion)
-        await self.db.flush()
-        await self.db.refresh(notificacion)
+        await notificacion.insert()
         return notificacion
 
     async def bulk_create(
@@ -99,77 +100,72 @@ class NotificacionRepository:
         """
         Crea varias notificaciones a la vez (ej. notificar a todos los
         miembros de un proyecto cuando se completa una generación).
+        (Cada insert() asigna el ObjectId de su ítem: el bucle sustituye
+        al add_all + refresh del Ciclo 1.)
         """
-        self.db.add_all(notificaciones)
-        await self.db.flush()
-        for n in notificaciones:
-            await self.db.refresh(n)
+        for notificacion in notificaciones:
+            await notificacion.insert()
         return notificaciones
 
     async def update(self, notificacion: Notificacion) -> Notificacion:
-        await self.db.flush()
-        await self.db.refresh(notificacion)
+        await notificacion.save()
         return notificacion
 
     async def marcar_leida(
-        self, notificacion_id: int, *, leida: bool = True
+        self,
+        notificacion_id: PydanticObjectId,
+        *,
+        leida: bool = True,
     ) -> Optional[Notificacion]:
         notificacion = await self.get_by_id(notificacion_id)
         if notificacion is None:
             return None
         notificacion.leida = leida
-        await self.db.flush()
-        await self.db.refresh(notificacion)
+        await notificacion.save()
         return notificacion
 
     async def marcar_varias_leidas(
-        self, usuario_id: int, ids: list[int]
+        self,
+        usuario_id: PydanticObjectId,
+        ids: list[PydanticObjectId],
     ) -> int:
         """
-        Marca varias notificaciones del usuario como leídas de una sola vez.
-        Solo afecta a las que pertenecen al usuario (defensa contra IDs ajenos).
-        Devuelve cuántas filas se actualizaron.
+        Marca varias notificaciones del usuario como leídas de una sola
+        vez. Solo afecta a las que pertenecen al usuario (defensa contra
+        IDs ajenos). Devuelve cuántas se actualizaron. ($in del Ciclo 2
+        ≈ IN de SQL; la condición de usuario y leida=false viaja en la
+        MISMA consulta.)
         """
         if not ids:
             return 0
-        result = await self.db.execute(
-            sa_update(Notificacion)
-            .where(
-                Notificacion.id_usuario == usuario_id,
-                Notificacion.id.in_(ids),
-                Notificacion.leida.is_(False),
-            )
-            .values(leida=True)
-        )
-        await self.db.flush()
-        return int(result.rowcount or 0)
+        resultado = await Notificacion.find(
+            Notificacion.id_usuario == usuario_id,
+            {"_id": {"$in": ids}},
+            Notificacion.leida == False,  # noqa: E712
+        ).update({"$set": {"leida": True}})
+        return int(getattr(resultado, "modified_count", 0) or 0)
 
-    async def marcar_todas_leidas(self, usuario_id: int) -> int:
-        """Marca todas las notificaciones no leídas de un usuario como leídas."""
-        result = await self.db.execute(
-            sa_update(Notificacion)
-            .where(
-                Notificacion.id_usuario == usuario_id,
-                Notificacion.leida.is_(False),
-            )
-            .values(leida=True)
-        )
-        await self.db.flush()
-        return int(result.rowcount or 0)
+    async def marcar_todas_leidas(
+        self, usuario_id: PydanticObjectId
+    ) -> int:
+        """Marca todas las notificaciones no leídas de un usuario como
+        leídas. Devuelve cuántas se actualizaron."""
+        resultado = await Notificacion.find(
+            Notificacion.id_usuario == usuario_id,
+            Notificacion.leida == False,  # noqa: E712
+        ).update({"$set": {"leida": True}})
+        return int(getattr(resultado, "modified_count", 0) or 0)
 
     async def delete(self, notificacion: Notificacion) -> None:
-        await self.db.delete(notificacion)
-        await self.db.flush()
+        await notificacion.delete()
 
-    async def delete_leidas_by_usuario(self, usuario_id: int) -> int:
-        """Limpia todas las notificaciones ya leídas de un usuario."""
-        from sqlalchemy import delete as sa_delete
-
-        result = await self.db.execute(
-            sa_delete(Notificacion).where(
-                Notificacion.id_usuario == usuario_id,
-                Notificacion.leida.is_(True),
-            )
-        )
-        await self.db.flush()
-        return int(result.rowcount or 0)
+    async def delete_leidas_by_usuario(
+        self, usuario_id: PydanticObjectId
+    ) -> int:
+        """Limpia todas las notificaciones ya leídas de un usuario.
+        Devuelve cuántas borró."""
+        resultado = await Notificacion.find(
+            Notificacion.id_usuario == usuario_id,
+            Notificacion.leida == True,  # noqa: E712
+        ).delete()
+        return int(getattr(resultado, "deleted_count", 0) or 0)

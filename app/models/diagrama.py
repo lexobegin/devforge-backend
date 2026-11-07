@@ -1,329 +1,80 @@
 # app/models/diagrama.py
 """
-Modelos ORM del módulo C. Modelado UML (Diagrama de Clases):
+Documentos del módulo C. Modelado UML (Diagrama de Clases) — CICLO 2.
 
-- Diagrama                  → un diagrama de clases dentro de un proyecto.
-- ClaseUML                  → una clase UML (futura entidad/tabla al generar).
-- AtributoUML               → atributo de una clase (futura columna).
-- OperacionUML              → operación/método de una clase.
-- ParametroOperacionUML     → parámetro de entrada de una operación.
-- InterfazUML               → interfaz UML («contrato»).
-- OperacionInterfazUML      → operación declarada por una interfaz.
-- RelacionUML               → relación entre dos clases (asociación, herencia…).
+- Diagrama               → un diagrama de clases dentro de un proyecto
+                           (colección "diagramas").
+- ClaseUML               → una clase UML (EMBEDIDA en Diagrama.clases).
+- AtributoUML            → atributo de una clase, futura columna al
+                           generar (EMBEDIDO en ClaseUML.atributos).
+- OperacionUML           → operación/método de una clase (EMBEDIDO).
+- ParametroOperacionUML  → parámetro de entrada de una operación (EMBEDIDO).
+- InterfazUML            → interfaz UML «contrato» (EMBEDIDA).
+- OperacionInterfazUML   → operación declarada por una interfaz (EMBEDIDO).
+- RelacionUML            → relación entre dos clases: asociación,
+                           agregación, composición, dependencia,
+                           generalización o realización (EMBEDIDA).
 
-Alineado 1:1 con el script SQL (módulo C).
+Cambios clave respecto al Ciclo 1 (7 tablas → 1 documento):
+- En Ciclo 1 un diagrama se dispersaba en 7 tablas relacionadas
+  (diagramas, clases_uml, atributos_uml, operaciones_uml,
+  parametros_operacion_uml, interfaces_uml, relaciones_uml): leer el
+  lienzo completo costaba hasta 7 consultas. En Ciclo 2 TODO el diagrama
+  vive en UN documento: la lectura del lienzo es atómica (1 consulta) y
+  cada cambio colaborativo es una única escritura coherente.
+- Esta estructura es la que explota el Agente Dev (CU18): el ejecutor de
+  acciones modifica clases/atributos/relaciones embebidas y guarda el
+  documento completo validando contra UML 2.5.1 (corrige la deficiencia
+  del Ciclo 1 de dibujar "cajas vacías").
+- Los ids INT autoincrementales de las tablas hijas se sustituyen por ids
+  uuid (hex) generados en la aplicación: el lienzo, el WebSocket y las
+  acciones de la IA los usan como referencia estable incluso antes de
+  persistir (el frontend también puede generarlos).
+- id_clase_origen / id_clase_destino de RelacionUML ya no son FK a la
+  tabla clases_uml: son referencias a los ids uuid de las clases
+  embebidas del MISMO diagrama.
+- Las relationships de SQLAlchemy desaparecen; los helpers clase(),
+  interfaz(), relacion() y buscar_clase_por_nombre() dan acceso directo a
+  los elementos embebidos.
+- version_uml y numero_version se conservan (UML 2.5.1 + versionado).
 """
 
-from datetime import datetime
-from decimal import Decimal
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Literal, Optional
+from uuid import uuid4
 
-from sqlalchemy import (
-    Boolean,
-    CheckConstraint,
-    DateTime,
-    ForeignKey,
-    Integer,
-    Numeric,
-    String,
-    func,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from beanie import Document, PydanticObjectId
+from pydantic import BaseModel, Field
 
-from app.database import Base
-
-
-# ======================================================================
-# Diagrama
-# ======================================================================
-class Diagrama(Base):
-    __tablename__ = "diagramas"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_proyecto: Mapped[int] = mapped_column(
-        ForeignKey("proyectos.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    nombre: Mapped[str] = mapped_column(String(150), nullable=False)
-
-    version_uml: Mapped[str] = mapped_column(
-        String(10), nullable=False, default="2.5.1", server_default="2.5.1"
-    )
-
-    numero_version: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=1, server_default="1"
-    )
-
-    id_creador: Mapped[int] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
-    )
-
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    proyecto: Mapped["Proyecto"] = relationship(  # noqa: F821
-        "Proyecto",
-        foreign_keys=[id_proyecto],
-    )
-
-    creador: Mapped["Usuario"] = relationship(  # noqa: F821
-        "Usuario",
-        foreign_keys=[id_creador],
-    )
-
-    clases: Mapped[list["ClaseUML"]] = relationship(
-        "ClaseUML",
-        back_populates="diagrama",
-        cascade="all, delete-orphan",
-    )
-
-    interfaces: Mapped[list["InterfazUML"]] = relationship(
-        "InterfazUML",
-        back_populates="diagrama",
-        cascade="all, delete-orphan",
-    )
-
-    relaciones: Mapped[list["RelacionUML"]] = relationship(
-        "RelacionUML",
-        back_populates="diagrama",
-        cascade="all, delete-orphan",
-        foreign_keys="RelacionUML.id_diagrama",
-    )
-
-    def __repr__(self) -> str:
-        return (
-            f"<Diagrama id={self.id} proyecto={self.id_proyecto} "
-            f"nombre={self.nombre!r} v={self.numero_version}>"
-        )
+# Literales que reemplazan a los CHECK del Ciclo 1
+VisibilidadUML = Literal["+", "-", "#", "~"]
+TipoRelacion = Literal[
+    "ASOCIACION",
+    "AGREGACION",
+    "COMPOSICION",
+    "DEPENDENCIA",
+    "GENERALIZACION",
+    "REALIZACION",
+]
 
 
 # ======================================================================
-# ClaseUML
+# ParametroOperacionUML (embebido)
 # ======================================================================
-class ClaseUML(Base):
-    __tablename__ = "clases_uml"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_diagrama: Mapped[int] = mapped_column(
-        ForeignKey("diagramas.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    nombre: Mapped[str] = mapped_column(String(150), nullable=False)
-
-    es_abstracta: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
-
-    estereotipo: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-
-    pos_x: Mapped[Decimal] = mapped_column(
-        Numeric(10, 2), nullable=True, default=0, server_default="0"
-    )
-
-    pos_y: Mapped[Decimal] = mapped_column(
-        Numeric(10, 2), nullable=True, default=0, server_default="0"
-    )
-
-    id_creador: Mapped[int] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
-    )
-
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
+class ParametroOperacionUML(BaseModel):  # embebido: los embebidos de Beanie son pydantic
+    """Parámetro de entrada de una operación (antes tabla
+    parametros_operacion_uml)."""
 
     # ------------------------------------------------------------------
-    # Relaciones
+    # Campos
     # ------------------------------------------------------------------
-    diagrama: Mapped["Diagrama"] = relationship(
-        "Diagrama", back_populates="clases"
-    )
+    id: str = Field(default_factory=lambda: uuid4().hex)
 
-    creador: Mapped["Usuario"] = relationship(  # noqa: F821
-        "Usuario", foreign_keys=[id_creador]
-    )
+    nombre: str
 
-    atributos: Mapped[list["AtributoUML"]] = relationship(
-        "AtributoUML",
-        back_populates="clase",
-        cascade="all, delete-orphan",
-        order_by="AtributoUML.orden",
-    )
+    tipo_dato: str
 
-    operaciones: Mapped[list["OperacionUML"]] = relationship(
-        "OperacionUML",
-        back_populates="clase",
-        cascade="all, delete-orphan",
-        order_by="OperacionUML.orden",
-    )
-
-    def __repr__(self) -> str:
-        return f"<ClaseUML id={self.id} nombre={self.nombre!r}>"
-
-
-# ======================================================================
-# AtributoUML
-# ======================================================================
-class AtributoUML(Base):
-    __tablename__ = "atributos_uml"
-    __table_args__ = (
-        CheckConstraint(
-            "visibilidad IN ('+','-','#','~')",
-            name="ck_atributo_visibilidad",
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_clase: Mapped[int] = mapped_column(
-        ForeignKey("clases_uml.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    nombre: Mapped[str] = mapped_column(String(100), nullable=False)
-
-    tipo_dato: Mapped[str] = mapped_column(String(50), nullable=False)
-
-    visibilidad: Mapped[str] = mapped_column(
-        String(1), nullable=False, default="-", server_default="-"
-    )
-
-    es_estatico: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
-
-    valor_defecto: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-
-    orden: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0, server_default="0"
-    )
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    clase: Mapped["ClaseUML"] = relationship(
-        "ClaseUML", back_populates="atributos"
-    )
-
-    def __repr__(self) -> str:
-        return (
-            f"<AtributoUML id={self.id} nombre={self.nombre!r} "
-            f"tipo={self.tipo_dato!r}>"
-        )
-
-
-# ======================================================================
-# OperacionUML
-# ======================================================================
-class OperacionUML(Base):
-    __tablename__ = "operaciones_uml"
-    __table_args__ = (
-        CheckConstraint(
-            "visibilidad IN ('+','-','#','~')",
-            name="ck_operacion_visibilidad",
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_clase: Mapped[int] = mapped_column(
-        ForeignKey("clases_uml.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    nombre: Mapped[str] = mapped_column(String(100), nullable=False)
-
-    tipo_retorno: Mapped[str] = mapped_column(
-        String(50), nullable=False, default="void", server_default="void"
-    )
-
-    visibilidad: Mapped[str] = mapped_column(
-        String(1), nullable=False, default="+", server_default="+"
-    )
-
-    es_estatico: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="false"
-    )
-
-    orden: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0, server_default="0"
-    )
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    clase: Mapped["ClaseUML"] = relationship(
-        "ClaseUML", back_populates="operaciones"
-    )
-
-    parametros: Mapped[list["ParametroOperacionUML"]] = relationship(
-        "ParametroOperacionUML",
-        back_populates="operacion",
-        cascade="all, delete-orphan",
-        order_by="ParametroOperacionUML.orden",
-    )
-
-    def __repr__(self) -> str:
-        return f"<OperacionUML id={self.id} nombre={self.nombre!r}>"
-
-
-# ======================================================================
-# ParametroOperacionUML
-# ======================================================================
-class ParametroOperacionUML(Base):
-    __tablename__ = "parametros_operacion_uml"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_operacion: Mapped[int] = mapped_column(
-        ForeignKey("operaciones_uml.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    nombre: Mapped[str] = mapped_column(String(100), nullable=False)
-
-    tipo_dato: Mapped[str] = mapped_column(String(50), nullable=False)
-
-    orden: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0, server_default="0"
-    )
-
-    # ------------------------------------------------------------------
-    # Relaciones
-    # ------------------------------------------------------------------
-    operacion: Mapped["OperacionUML"] = relationship(
-        "OperacionUML", back_populates="parametros"
-    )
+    orden: int = 0
 
     def __repr__(self) -> str:
         return (
@@ -333,148 +84,290 @@ class ParametroOperacionUML(Base):
 
 
 # ======================================================================
-# InterfazUML
+# AtributoUML (embebido)
 # ======================================================================
-class InterfazUML(Base):
-    __tablename__ = "interfaces_uml"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_diagrama: Mapped[int] = mapped_column(
-        ForeignKey("diagramas.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    nombre: Mapped[str] = mapped_column(String(150), nullable=False)
-
-    pos_x: Mapped[Decimal] = mapped_column(
-        Numeric(10, 2), nullable=True, default=0, server_default="0"
-    )
-
-    pos_y: Mapped[Decimal] = mapped_column(
-        Numeric(10, 2), nullable=True, default=0, server_default="0"
-    )
+class AtributoUML(BaseModel):  # embebido
+    """Atributo de una clase UML (antes tabla atributos_uml)."""
 
     # ------------------------------------------------------------------
-    # Relaciones
+    # Campos
     # ------------------------------------------------------------------
-    diagrama: Mapped["Diagrama"] = relationship(
-        "Diagrama", back_populates="interfaces"
-    )
+    id: str = Field(default_factory=lambda: uuid4().hex)
 
-    operaciones: Mapped[list["OperacionInterfazUML"]] = relationship(
-        "OperacionInterfazUML",
-        back_populates="interfaz",
-        cascade="all, delete-orphan",
-    )
+    nombre: str
+
+    tipo_dato: str
+
+    visibilidad: VisibilidadUML = "-"
+
+    es_estatico: bool = False
+
+    valor_defecto: Optional[str] = None
+
+    orden: int = 0
 
     def __repr__(self) -> str:
-        return f"<InterfazUML id={self.id} nombre={self.nombre!r}>"
+        return (
+            f"<AtributoUML id={self.id} nombre={self.nombre!r} "
+            f"tipo={self.tipo_dato!r}>"
+        )
 
 
 # ======================================================================
-# OperacionInterfazUML
+# OperacionUML (embebida)
 # ======================================================================
-class OperacionInterfazUML(Base):
-    __tablename__ = "operaciones_interfaz_uml"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_interfaz: Mapped[int] = mapped_column(
-        ForeignKey("interfaces_uml.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    nombre: Mapped[str] = mapped_column(String(100), nullable=False)
-
-    tipo_retorno: Mapped[str] = mapped_column(
-        String(50), nullable=False, default="void", server_default="void"
-    )
+class OperacionUML(BaseModel):  # embebido
+    """Operación/método de una clase UML (antes tabla operaciones_uml)."""
 
     # ------------------------------------------------------------------
-    # Relaciones
+    # Campos
     # ------------------------------------------------------------------
-    interfaz: Mapped["InterfazUML"] = relationship(
-        "InterfazUML", back_populates="operaciones"
-    )
+    id: str = Field(default_factory=lambda: uuid4().hex)
+
+    nombre: str
+
+    tipo_retorno: str = "void"
+
+    visibilidad: VisibilidadUML = "+"
+
+    es_estatico: bool = False
+
+    orden: int = 0
+
+    # Parámetros EMBEBIDOS (antes tabla parametros_operacion_uml)
+    parametros: list[ParametroOperacionUML] = Field(default_factory=list)
+
+    def __repr__(self) -> str:
+        return f"<OperacionUML id={self.id} nombre={self.nombre!r}>"
+
+
+# ======================================================================
+# OperacionInterfazUML (embebida)
+# ======================================================================
+class OperacionInterfazUML(BaseModel):  # embebido
+    """Operación declarada por una interfaz (antes tabla
+    operaciones_interfaz_uml)."""
+
+    # ------------------------------------------------------------------
+    # Campos
+    # ------------------------------------------------------------------
+    id: str = Field(default_factory=lambda: uuid4().hex)
+
+    nombre: str
+
+    tipo_retorno: str = "void"
 
     def __repr__(self) -> str:
         return f"<OperacionInterfazUML id={self.id} nombre={self.nombre!r}>"
 
 
 # ======================================================================
-# RelacionUML
+# InterfazUML (embebida)
 # ======================================================================
-class RelacionUML(Base):
-    __tablename__ = "relaciones_uml"
-    __table_args__ = (
-        CheckConstraint(
-            "tipo_relacion IN "
-            "('ASOCIACION','AGREGACION','COMPOSICION','DEPENDENCIA',"
-            "'GENERALIZACION','REALIZACION')",
-            name="ck_relacion_tipo",
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    id_diagrama: Mapped[int] = mapped_column(
-        ForeignKey("diagramas.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    id_clase_origen: Mapped[int] = mapped_column(
-        ForeignKey("clases_uml.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    id_clase_destino: Mapped[int] = mapped_column(
-        ForeignKey("clases_uml.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    tipo_relacion: Mapped[str] = mapped_column(String(20), nullable=False)
-
-    multiplicidad_origen: Mapped[Optional[str]] = mapped_column(
-        String(10), nullable=True
-    )
-
-    multiplicidad_destino: Mapped[Optional[str]] = mapped_column(
-        String(10), nullable=True
-    )
-
-    nombre_asociacion: Mapped[Optional[str]] = mapped_column(
-        String(100), nullable=True
-    )
-
-    rol_origen: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-
-    rol_destino: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+class InterfazUML(BaseModel):  # embebido
+    """Interfaz UML «contrato» (antes tabla interfaces_uml)."""
 
     # ------------------------------------------------------------------
-    # Relaciones
+    # Campos
     # ------------------------------------------------------------------
-    diagrama: Mapped["Diagrama"] = relationship(
-        "Diagrama",
-        back_populates="relaciones",
-        foreign_keys=[id_diagrama],
+    id: str = Field(default_factory=lambda: uuid4().hex)
+
+    nombre: str
+
+    pos_x: float = 0.0
+
+    pos_y: float = 0.0
+
+    # Operaciones EMBEBIDAS (antes tabla operaciones_interfaz_uml)
+    operaciones: list[OperacionInterfazUML] = Field(default_factory=list)
+
+    def __repr__(self) -> str:
+        return f"<InterfazUML id={self.id} nombre={self.nombre!r}>"
+
+
+# ======================================================================
+# ClaseUML (embebida)
+# ======================================================================
+class ClaseUML(BaseModel):  # embebido
+    """Clase UML del diagrama (antes tabla clases_uml)."""
+
+    # ------------------------------------------------------------------
+    # Campos
+    # ------------------------------------------------------------------
+    id: str = Field(default_factory=lambda: uuid4().hex)
+
+    nombre: str
+
+    es_abstracta: bool = False
+
+    estereotipo: Optional[str] = None
+
+    pos_x: float = 0.0
+
+    pos_y: float = 0.0
+
+    # ObjectId del usuario creador (antes FK a usuarios.id). Opcional solo
+    # para importaciones XMI del Ciclo 1; los servicios lo asignan siempre.
+    id_creador: Optional[PydanticObjectId] = None
+
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
     )
 
-    clase_origen: Mapped["ClaseUML"] = relationship(
-        "ClaseUML", foreign_keys=[id_clase_origen]
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
     )
 
-    clase_destino: Mapped["ClaseUML"] = relationship(
-        "ClaseUML", foreign_keys=[id_clase_destino]
-    )
+    # ------------------------------------------------------------------
+    # Elementos EMBEBIDOS de la clase
+    # (antes tablas atributos_uml y operaciones_uml)
+    # ------------------------------------------------------------------
+    atributos: list[AtributoUML] = Field(default_factory=list)
+
+    operaciones: list[OperacionUML] = Field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def atributo(self, id_atributo: str) -> Optional[AtributoUML]:
+        """Devuelve el atributo con ese id (o None)."""
+        for atributo in self.atributos:
+            if atributo.id == id_atributo:
+                return atributo
+        return None
+
+    def operacion(self, id_operacion: str) -> Optional[OperacionUML]:
+        """Devuelve la operación con ese id (o None)."""
+        for operacion in self.operaciones:
+            if operacion.id == id_operacion:
+                return operacion
+        return None
+
+    def __repr__(self) -> str:
+        return f"<ClaseUML id={self.id} nombre={self.nombre!r}>"
+
+
+# ======================================================================
+# RelacionUML (embebida)
+# ======================================================================
+class RelacionUML(BaseModel):  # embebido
+    """Relación entre dos clases del mismo diagrama (antes tabla
+    relaciones_uml)."""
+
+    # ------------------------------------------------------------------
+    # Campos
+    # ------------------------------------------------------------------
+    id: str = Field(default_factory=lambda: uuid4().hex)
+
+    # Referencias a los ids uuid de las ClaseUML embebidas
+    id_clase_origen: str
+
+    id_clase_destino: str
+
+    tipo_relacion: TipoRelacion
+
+    multiplicidad_origen: Optional[str] = None
+
+    multiplicidad_destino: Optional[str] = None
+
+    nombre_asociacion: Optional[str] = None
+
+    rol_origen: Optional[str] = None
+
+    rol_destino: Optional[str] = None
 
     def __repr__(self) -> str:
         return (
             f"<RelacionUML id={self.id} tipo={self.tipo_relacion!r} "
             f"{self.id_clase_origen}->{self.id_clase_destino}>"
+        )
+
+
+# ======================================================================
+# Diagrama
+# ======================================================================
+class Diagrama(Document):
+    """Diagrama de clases UML (colección "diagramas")."""
+
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla diagramas)
+    # ------------------------------------------------------------------
+    id_proyecto: PydanticObjectId
+
+    nombre: str
+
+    version_uml: str = "2.5.1"
+
+    numero_version: int = 1
+
+    id_creador: PydanticObjectId
+
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    # ------------------------------------------------------------------
+    # Contenido del lienzo EMBEBIDO
+    # (antes tablas clases_uml, interfaces_uml y relaciones_uml)
+    # ------------------------------------------------------------------
+    clases: list[ClaseUML] = Field(default_factory=list)
+
+    interfaces: list[InterfazUML] = Field(default_factory=list)
+
+    relaciones: list[RelacionUML] = Field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Configuración del documento
+    # ------------------------------------------------------------------
+    class Settings:
+        name = "diagramas"           # mismo nombre que la tabla del Ciclo 1
+        indexes = ["id_proyecto", "id_creador"]
+
+    # ------------------------------------------------------------------
+    # Helpers — acceso directo a los elementos embebidos
+    # (los usan el WebSocket de colaboración, el ejecutor de acciones del
+    #  Agente Dev y el exportador/importador XMI)
+    # ------------------------------------------------------------------
+    def clase(self, id_clase: str) -> Optional[ClaseUML]:
+        """Devuelve la clase embebida con ese id (o None)."""
+        for clase in self.clases:
+            if clase.id == id_clase:
+                return clase
+        return None
+
+    def interfaz(self, id_interfaz: str) -> Optional[InterfazUML]:
+        """Devuelve la interfaz embebida con ese id (o None)."""
+        for interfaz in self.interfaces:
+            if interfaz.id == id_interfaz:
+                return interfaz
+        return None
+
+    def relacion(self, id_relacion: str) -> Optional[RelacionUML]:
+        """Devuelve la relación embebida con ese id (o None)."""
+        for relacion in self.relaciones:
+            if relacion.id == id_relacion:
+                return relacion
+        return None
+
+    def buscar_clase_por_nombre(self, nombre: str) -> Optional[ClaseUML]:
+        """Resuelve una clase por nombre (sin distinguir mayúsculas).
+
+        La usa el Agente Dev (CU18) cuando la acción de la IA nombra la
+        clase en lenguaje natural («añade un atributo a la clase
+        Usuario...») y necesita su id uuid.
+        """
+        objetivo = nombre.strip().casefold()
+        for clase in self.clases:
+            if clase.nombre.strip().casefold() == objetivo:
+                return clase
+        return None
+
+    def __repr__(self) -> str:
+        return (
+            f"<Diagrama id={self.id} proyecto={self.id_proyecto} "
+            f"nombre={self.nombre!r} v={self.numero_version}>"
         )

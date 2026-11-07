@@ -1,6 +1,7 @@
 # app/api/v1/auditoria_router.py
 """
-Endpoints del módulo de Auditoría (CU3 — Consultar Bitácora del Sistema):
+Endpoints del módulo de Auditoría (CU3 — Consultar Bitácora del Sistema)
+— CICLO 2.
 
 - GET /api/v1/auditoria                          → listar bitácora con filtros
 - GET /api/v1/auditoria/entidad/{entidad}/{id}   → eventos de un recurso concreto
@@ -9,18 +10,22 @@ Endpoints del módulo de Auditoría (CU3 — Consultar Bitácora del Sistema):
 - GET /api/v1/auditoria/exportar/pdf             → exportar a PDF
 
 Todos los endpoints requieren rol ADMIN.
+
+CICLO 2 (reconvertido del Ciclo 1): SIN AsyncSession; el id del recurso
+en la ruta de /entidad es str (los ObjectId van como hex; en el Ciclo 1
+era el int del serial) y id_usuario es PydanticObjectId. Los filtros de
+rango de fechas y el streaming de exportaciones se conservan igual.
 """
 
 from datetime import datetime
 from io import BytesIO
 from typing import Optional
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import require_admin
-from app.database import get_db
 from app.models.usuario import Usuario
 from app.schemas.auditoria_schema import BitacoraSistemaResponse
 from app.services.auditoria_service import AuditoriaService
@@ -43,15 +48,14 @@ router = APIRouter()
 async def listar_bitacora(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
-    id_usuario: Optional[int] = Query(None, gt=0),
+    id_usuario: Optional[PydanticObjectId] = Query(None),
     tipo_evento: Optional[str] = Query(None, max_length=50),
     entidad_afectada: Optional[str] = Query(None, max_length=30),
     desde: Optional[datetime] = Query(None, description="ISO 8601"),
     hasta: Optional[datetime] = Query(None, description="ISO 8601"),
     _admin: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ) -> dict:
-    service = AuditoriaService(db)
+    service = AuditoriaService()
     items, total = await service.listar(
         skip=skip,
         limit=limit,
@@ -79,17 +83,17 @@ async def listar_bitacora(
     response_model=list[BitacoraSistemaResponse],
     summary="Eventos de un recurso concreto (solo ADMIN)",
     description=(
-        "Ej: /auditoria/entidad/DIAGRAMA/42 devuelve todos los eventos "
-        "relacionados con el diagrama #42."
+        "Ej: /auditoria/entidad/DIAGRAMA/665f1a… devuelve todos los eventos "
+        "relacionados con ese diagrama (el id es el ObjectId en hex; en el "
+        "Ciclo 1 era el int del serial)."
     ),
 )
 async def listar_por_entidad(
     entidad_afectada: str,
-    id_entidad_afectada: int,
+    id_entidad_afectada: str,
     _admin: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = AuditoriaService(db)
+    service = AuditoriaService()
     items = await service.listar_por_entidad(
         entidad_afectada.upper(), id_entidad_afectada
     )
@@ -102,13 +106,12 @@ async def listar_por_entidad(
     summary="Eventos de un usuario (solo ADMIN)",
 )
 async def listar_por_usuario(
-    usuario_id: int,
+    usuario_id: PydanticObjectId,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
     _admin: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = AuditoriaService(db)
+    service = AuditoriaService()
     items = await service.listar_por_usuario(
         usuario_id, skip=skip, limit=limit
     )
@@ -127,15 +130,14 @@ async def listar_por_usuario(
     ),
 )
 async def exportar_excel(
-    id_usuario: Optional[int] = Query(None, gt=0),
+    id_usuario: Optional[PydanticObjectId] = Query(None),
     tipo_evento: Optional[str] = Query(None, max_length=50),
     entidad_afectada: Optional[str] = Query(None, max_length=30),
     desde: Optional[datetime] = Query(None),
     hasta: Optional[datetime] = Query(None),
     _admin: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = AuditoriaService(db)
+    service = AuditoriaService()
     contenido = await service.exportar_excel(
         id_usuario=id_usuario,
         tipo_evento=tipo_evento,
@@ -163,15 +165,14 @@ async def exportar_excel(
     description="Genera un PDF con los eventos que cumplan los filtros.",
 )
 async def exportar_pdf(
-    id_usuario: Optional[int] = Query(None, gt=0),
+    id_usuario: Optional[PydanticObjectId] = Query(None),
     tipo_evento: Optional[str] = Query(None, max_length=50),
     entidad_afectada: Optional[str] = Query(None, max_length=30),
     desde: Optional[datetime] = Query(None),
     hasta: Optional[datetime] = Query(None),
     _admin: Usuario = Depends(require_admin),
-    db: AsyncSession = Depends(get_db),
 ):
-    service = AuditoriaService(db)
+    service = AuditoriaService()
     contenido = await service.exportar_pdf(
         id_usuario=id_usuario,
         tipo_evento=tipo_evento,

@@ -1,0 +1,63 @@
+// Generado por DevForge AI (CU24) — listado de {{ ent.nombre }}
+import { useCallback, useEffect, useState } from "react";
+import { eliminar{{ ent.nombre }}, listar{{ ent.nombre }} } from "../api/{{ ent.recurso }}";
+import type { {{ ent.nombre }} } from "../tipos/{{ ent.recurso }}";
+
+export default function {{ ent.nombre }}Lista() {
+  const [items, setItems] = useState<{{ ent.nombre }}[]>([]);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const cargar = useCallback(async () => {
+    setCargando(true);
+    setError(null);
+    try {
+      setItems(await listar{{ ent.nombre }}());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCargando(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void cargar();
+  }, [cargar]);
+
+  async function quitar(id: string) {
+    await eliminar{{ ent.nombre }}(id);
+    await cargar();
+  }
+
+  return (
+    <section className="lista-{{ ent.recurso }}">
+      <h2>Listado de {{ ent.nombre }}</h2>
+      {cargando ? <p>Cargando…</p> : null}
+      {error ? <p className="error">{error}</p> : null}
+      <table>
+        <thead>
+          <tr>
+{% for a in ent.atributos %}
+            <th>{{ a.nombre_original }}</th>
+{% endfor %}
+            <th>Acciones</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((item) => (
+            <tr key={item.id}>
+{% for a in ent.atributos %}
+              <td>{String(item.{{ a.nombre_js }} ?? "")}</td>
+{% endfor %}
+              <td>
+                <button onClick={() => item.id && void quitar(item.id)}>
+                  Eliminar
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}

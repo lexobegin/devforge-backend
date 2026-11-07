@@ -13,6 +13,10 @@ Flujo:
 Opcionalmente, si hay conexión y proveedor externo de visión configurado,
 se puede delegar a un modelo en la nube para mayor precisión. Ese camino
 queda como punto de extensión (no implementado en esta versión).
+
+CICLO 2: archivo conservado TAL CUAL del Ciclo 1. Las excepciones que
+usa (AIServiceError, BadRequestError) existen en el exceptions REAL del
+Ciclo 2 (Tanda 19) con el mismo nombre y status que el Ciclo 1.
 """
 
 import logging

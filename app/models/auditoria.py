@@ -1,69 +1,66 @@
 # app/models/auditoria.py
 """
-Modelo ORM del módulo de Auditoría:
+Documentos del módulo de Auditoría — CICLO 2.
 
 - BitacoraSistema → bitácora general de eventos relevantes del sistema
                     (no confundir con historial_cambios_diagrama, que es
-                    específico de cambios dentro de un diagrama).
+                    específico de cambios dentro de un diagrama) —
+                    colección "bitacora_sistema".
 
 Registra lo esencial: quién, qué, cuándo y sobre qué recurso.
 
 Alineado 1:1 con el script SQL (módulo de Auditoría).
+
+Cambios respecto al Ciclo 1 (tabla PostgreSQL → documento MongoDB):
+- id_usuario (FK con ondelete SET NULL) → Optional[PydanticObjectId]: None
+  significa que el evento lo disparó el propio sistema (mismo significado
+  que el NULL del Ciclo 1, sin ON DELETE: en MongoDB no hay cascadas).
+- id_entidad_afectada (BIGINT polimórfico, sin FK) → Optional[str]: str(id)
+  de un Document o id uuid de un elemento embebido, según
+  `entidad_afectada`.
+- La relationship usuario desaparece.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import (
-    BigInteger,
-    DateTime,
-    ForeignKey,
-    String,
-    func,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.database import Base
+from beanie import Document, PydanticObjectId
+from pydantic import Field
 
 
-class BitacoraSistema(Base):
-    __tablename__ = "bitacora_sistema"
+# ======================================================================
+# BitacoraSistema
+# ======================================================================
+class BitacoraSistema(Document):
+    """Evento general del sistema (colección "bitacora_sistema")."""
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # ------------------------------------------------------------------
+    # Campos (antes columnas de la tabla bitacora_sistema)
+    # ------------------------------------------------------------------
+    # Quién generó el evento (None si lo disparó el propio sistema).
+    id_usuario: Optional[PydanticObjectId] = None
 
-    # Quién generó el evento (NULL si lo disparó el propio sistema).
-    id_usuario: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("usuarios.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
+    # 'LOGIN', 'PROYECTO_CREADO', 'GENERACION_COMPLETADA', etc.
+    tipo_evento: str
 
-    # 'LOGIN','PROYECTO_CREADO','GENERACION_COMPLETADA', etc.
-    tipo_evento: Mapped[str] = mapped_column(String(50), nullable=False)
+    descripcion: str
 
-    descripcion: Mapped[str] = mapped_column(String(255), nullable=False)
-
-    # 'PROYECTO','DIAGRAMA','TRABAJO_GENERACION' (opcional).
-    entidad_afectada: Mapped[Optional[str]] = mapped_column(
-        String(30), nullable=True
-    )
+    # 'PROYECTO', 'DIAGRAMA', 'TRABAJO_GENERACION' (opcional).
+    entidad_afectada: Optional[str] = None
 
     # id del recurso relacionado (opcional). Polimórfico, sin FK.
-    id_entidad_afectada: Mapped[Optional[int]] = mapped_column(
-        BigInteger, nullable=True
-    )
+    id_entidad_afectada: Optional[str] = None
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), nullable=False, server_default=func.now()
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
     )
 
     # ------------------------------------------------------------------
-    # Relaciones
+    # Configuración del documento
     # ------------------------------------------------------------------
-    usuario: Mapped[Optional["Usuario"]] = relationship(  # noqa: F821
-        "Usuario",
-        foreign_keys=[id_usuario],
-    )
+    class Settings:
+        name = "bitacora_sistema"  # mismo nombre que la tabla del Ciclo 1
+        indexes = ["id_usuario"]
 
     def __repr__(self) -> str:
         return (
