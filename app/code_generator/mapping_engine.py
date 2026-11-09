@@ -43,6 +43,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from app.utils.identificadores import filtrar_identificadores_redundantes
+
 
 # ======================================================================
 # Tablas de mapeo
@@ -226,7 +228,17 @@ class MappingEngine:
         tiene_pk = False
         imports: set[str] = set()
 
-        for attr in getattr(clase, "atributos", []) or []:
+        # Tanda B25: si la clase trae `id` + `id<Clase>` (diagramas viejos
+        # guardados antes de la normalización en los puntos de inserción),
+        # el redundante NO se mapea → la entidad queda con UN solo
+        # identificador (`id` como PK BIGSERIAL).
+        atributos_uml = filtrar_identificadores_redundantes(
+            list(getattr(clase, "atributos", []) or []),
+            nombre_original,
+            extraer_nombre=lambda a: getattr(a, "nombre", ""),
+        )
+
+        for attr in atributos_uml:
             campo = self._mapear_atributo(attr, es_pk_candidata=not tiene_pk)
             if campo.es_clave_primaria:
                 tiene_pk = True

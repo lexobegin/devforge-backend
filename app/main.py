@@ -90,6 +90,12 @@ app.add_middleware(
     allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
     allow_methods=settings.CORS_ALLOW_METHODS,
     allow_headers=settings.CORS_ALLOW_HEADERS,
+    # Tanda B22: sin esto el navegador OCULTA Content-Disposition al JS
+    # (solo expone Cache-Control/Content-Language/Content-Type/Expires/
+    # Last-Modified/Pragma) y el frontend no puede leer el nombre real
+    # del ZIP/XMI que fijan los FileResponse de generacion_router e
+    # intercambio_router (el descargaba como devforge-backend-<id>.zip).
+    expose_headers=["Content-Disposition"],
 )
 
 
@@ -103,6 +109,7 @@ register_exception_handlers(app)
 # Routers (API v1) — los MISMOS 13 routers que el Ciclo 1 (Tanda 19)
 # ----------------------------------------------------------------------
 from app.api.v1 import (  # noqa: E402
+    admin_router,
     ai_vision_router,
     auditoria_router,
     auth_router,
@@ -201,6 +208,14 @@ app.include_router(
     auditoria_router.router,
     prefix=f"{settings.API_V1_PREFIX}/auditoria",
     tags=["Auditoría"],
+)
+
+# --- Administración de archivos del servidor (Tanda B24, punto 5 del
+# reporte de pruebas: exports/generated_projects/uploads sin gestión) ---
+app.include_router(
+    admin_router.router,
+    prefix=f"{settings.API_V1_PREFIX}/admin",
+    tags=["Administración"],
 )
 
 

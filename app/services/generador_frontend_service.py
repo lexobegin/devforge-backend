@@ -67,6 +67,7 @@ from app.config import settings
 from app.core.exceptions import NotFoundError, ValidationError
 from app.models.diagrama import ClaseUML, Diagrama
 from app.models.generacion import EntidadGenerada, TrabajoGeneracionCodigo
+from app.utils.identificadores import filtrar_identificadores_redundantes
 from app.repositories.diagrama_repository import DiagramaRepository
 from app.repositories.generacion_repository import TrabajoGeneracionRepository
 from app.repositories.proyecto_repository import MiembroProyectoRepository
@@ -331,7 +332,18 @@ class GeneradorFrontendService:
 
     @staticmethod
     def _contexto_de_clase(clase: ClaseUML) -> dict:
-        """ClaseUML → contexto de las plantillas de entidad (CRUD)."""
+        """ClaseUML → contexto de las plantillas de entidad (CRUD).
+
+        Tanda B25: descarta el identificador redundante `id<Clase>`
+        cuando la clase ya trae `id` — misma regla que el generador
+        Spring (mapping_engine), para que el CRUD React no muestre dos
+        identificadores.
+        """
+        atributos = filtrar_identificadores_redundantes(
+            list(clase.atributos),
+            clase.nombre,
+            extraer_nombre=lambda a: a.nombre,
+        )
         return {
             "nombre": _a_pascal(clase.nombre),
             "recurso": _a_recurso(clase.nombre),
@@ -348,7 +360,7 @@ class GeneradorFrontendService:
                     "valor_defecto": atributo.valor_defecto,
                     "es_estatico": atributo.es_estatico,
                 }
-                for atributo in clase.atributos
+                for atributo in atributos
             ],
             "operaciones": [
                 {

@@ -75,6 +75,7 @@ from app.core.exceptions import (
 from app.ia.prompts import VOCABULARIO_ACCIONES
 from app.models.accion_ia import AccionIA
 from app.models.diagrama import AtributoUML, ClaseUML, Diagrama, RelacionUML
+from app.utils.identificadores import filtrar_identificadores_redundantes
 from app.repositories.accion_ia_repository import AccionIARepository
 from app.repositories.diagrama_repository import DiagramaRepository
 from app.repositories.proyecto_repository import MiembroProyectoRepository
@@ -402,6 +403,15 @@ class EjecutorAccionesService:
         clase = ClaseUML(
             **datos.model_dump(),
             id_creador=id_usuario,
+        )
+        # Tanda B25: el Agente a veces propone `id` + `id<Clase>` en el
+        # MISMO payload (convención del LLM sobre el boceto ya leído).
+        # Se filtra el redundante antes de persistir — misma regla que
+        # visión/REST (ver app/utils/identificadores.py).
+        clase.atributos = filtrar_identificadores_redundantes(
+            clase.atributos,
+            clase.nombre,
+            extraer_nombre=lambda a: a.nombre,
         )
         diagrama.clases.append(clase)
         diagrama.updated_at = _ahora()

@@ -93,6 +93,49 @@ class UsuarioRepository:
         return await Usuario.find_one(filtro) is not None
 
     # ------------------------------------------------------------------
+    # Tanda B23 — candidatos a miembro y resolución de nombres
+    # ------------------------------------------------------------------
+    async def get_by_ids(
+        self, ids: Sequence[PydanticObjectId]
+    ) -> Sequence[Usuario]:
+        """Resuelve un lote de usuarios por id ($in). Sin paginación: la
+        lista de miembros de un proyecto es acotada."""
+        if not ids:
+            return []
+        return await Usuario.find({"_id": {"$in": list(ids)}}).to_list()
+
+    async def buscar_candidatos(
+        self,
+        *,
+        excluir_ids: Sequence[PydanticObjectId],
+        buscar: Optional[str] = None,
+        limit: int = 20,
+    ) -> Sequence[Usuario]:
+        """
+        Usuarios ACTIVOS que NO están en `excluir_ids` (los ya miembros),
+        opcionalmente filtrados por texto libre contra nombre_completo o
+        email (regex escapada, case-insensitive — mismo criterio que
+        get_by_email). Ordenados por nombre para que el selector del
+        modal muestre siempre el mismo orden.
+        """
+        filtro: dict = {"activo": True}
+        if excluir_ids:
+            filtro["_id"] = {"$nin": list(excluir_ids)}
+        texto = (buscar or "").strip()
+        if texto:
+            patron = re.escape(texto)
+            filtro["$or"] = [
+                {"nombre_completo": {"$regex": patron, "$options": "i"}},
+                {"email": {"$regex": patron, "$options": "i"}},
+            ]
+        return await (
+            Usuario.find(filtro)
+            .sort(+Usuario.nombre_completo)
+            .limit(limit)
+            .to_list()
+        )
+
+    # ------------------------------------------------------------------
     # Escrituras
     # ------------------------------------------------------------------
     async def create(self, usuario: Usuario) -> Usuario:

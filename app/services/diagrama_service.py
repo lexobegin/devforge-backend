@@ -80,6 +80,7 @@ from app.repositories.diagrama_repository import (
     RelacionUMLRepository,
 )
 from app.repositories.proyecto_repository import MiembroProyectoRepository
+from app.utils.identificadores import filtrar_identificadores_redundantes
 from app.schemas.diagrama_schema import (
     AtributoUMLCreate,
     AtributoUMLResponse,
@@ -247,7 +248,16 @@ class DiagramaService:
         # Crear atributos y operaciones anidados (si vienen en el payload).
         # Los creadores internos re-vinculan los embebidos en cada paso
         # (cada save() de Beanie re-instancia el contenido del documento).
-        for attr in datos.atributos:
+        #
+        # Tanda B25: `id` + `id<Clase>` (ej. Producto con `id` y
+        # `idproducto`, típico del volcado de visión) entran filtrados:
+        # el duplicado jamás persiste y export/generador quedan limpios.
+        atributos_limpios = filtrar_identificadores_redundantes(
+            list(datos.atributos),
+            clase.nombre,
+            extraer_nombre=lambda a: a.nombre,
+        )
+        for attr in atributos_limpios:
             await self._crear_atributo_interno(diagrama, clase, attr)
         for op in datos.operaciones:
             op_creada = await self._crear_operacion_interno(diagrama, clase, op)

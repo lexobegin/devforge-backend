@@ -18,6 +18,10 @@ gunicorn==22.0.0
 
 # --- Pydantic v2 y validación ---
 pydantic==2.9.2
+# FIX B22: el pin 2.5.2 era INCOMPATIBLE con app/config.py — NoDecode
+# (usado por CORS_ORIGINS/METHODS/HEADERS desde el parche de la T20) se
+# agregó en pydantic-settings 2.7.0; con 2.5.2 la app no importaba
+# ("cannot import name 'NoDecode'"). 2.7.1 mantiene la misma API.
 pydantic-settings==2.7.1
 email-validator==2.2.0
 

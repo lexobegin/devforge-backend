@@ -19,9 +19,10 @@ Cambios respecto al Ciclo 1:
   embebidos del Diagrama (ClaseUML.id, AtributoUML.id).
 - EstadoGeneracion unifica EstadoTrabajoGeneracion del Ciclo 1 con el
   Literal de app/models/generacion.py (mismos 4 estados).
-- StackDestino sigue siendo Literal de un solo valor en el schema (valida la
-  entrada del cliente); el modelo acepta texto libre porque CU24 añadirá
-  "REACT_TS_VITE" al generar el frontend React.
+- StackDestino: Literal de 2 valores desde la Tanda B21 (el frontend manda
+  stack_destino="REACT_TS_VITE" en el MISMO POST /generar y el router
+  deriva a GeneradorFrontendService; Ciclo 1 ya traía el campo en el
+  request precisamente para ese dispatch).
 - TrabajoGeneracionDetalleResponse ya no necesita ensamblar nada a mano:
   model_validate(trabajo) trae entidades y reglas anidadas (antes 3 tablas
   con joins).
@@ -39,7 +40,10 @@ from pydantic import BaseModel, ConfigDict, Field
 # ======================================================================
 EstadoGeneracion = Literal["PENDIENTE", "EN_PROCESO", "EXITOSO", "FALLIDO"]
 
-StackDestino = Literal["SPRING_BOOT_JPA_POSTGRES"]
+# Tanda B21: el dispatch de POST /generar decide el service por el valor
+# (SPRING_BOOT_JPA_POSTGRES → GeneratorService, REACT_TS_VITE →
+# GeneradorFrontendService). Hasta B21 solo validaba el stack de backend.
+StackDestino = Literal["SPRING_BOOT_JPA_POSTGRES", "REACT_TS_VITE"]
 
 
 # ======================================================================
@@ -163,9 +167,17 @@ class EstadoGeneracionResponse(BaseModel):
 
 
 class DescargaProyectoResponse(BaseModel):
-    """Respuesta al pedir la descarga del backend generado."""
+    """Respuesta al pedir la descarga del proyecto generado (ambos stacks)."""
 
     id_trabajo: PydanticObjectId  # string hex en JSON (antes int serial)
-    download_url: str = Field(..., description="URL para descargar el ZIP del backend")
+    download_url: str = Field(..., description="URL para descargar el ZIP")
     tamanio_bytes: Optional[int] = Field(None, ge=0)
     incluye_postman: bool = True
+    # Tanda B22: nombre real del archivo en el servidor (basename de
+    # ruta_salida, ej. frontend_ventas_6aee…_20261107_143454.zip) para que
+    # el frontend lo use como nombre de descarga en lugar de inventar
+    # devforge-backend-<id>.zip. El /archivo lo manda además en
+    # Content-Disposition (main.py lo expone por CORS desde B22).
+    nombre_archivo: Optional[str] = Field(
+        None, max_length=255, description="Nombre real del ZIP en el servidor"
+    )

@@ -44,6 +44,7 @@ from app.api.v1 import notificaciones_router
 
 # --- Administración y Auditoría ---
 from app.api.v1 import auditoria_router
+from app.api.v1 import admin_router
 
 
 __all__ = [
@@ -70,4 +71,6 @@ __all__ = [
     "notificaciones_router",
     # Auditoría
     "auditoria_router",
+    # Administración de archivos (Tanda B24)
+    "admin_router",
 ]
