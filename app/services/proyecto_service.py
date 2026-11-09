@@ -28,7 +28,7 @@ Cambios respecto al Ciclo 1 (SQLAlchemy → Beanie/MongoDB):
 """
 
 from datetime import datetime, timezone
-from typing import Sequence
+from typing import Optional, Sequence
 
 from beanie import PydanticObjectId
 
@@ -52,6 +52,7 @@ from app.schemas.proyecto_schema import (
     ProyectoCreate,
     ProyectoResponse,
     ProyectoUpdate,
+    UsuarioCandidatoResponse,
 )
 
 
@@ -262,7 +263,68 @@ class ProyectoService:
     ) -> Sequence[MiembroProyectoResponse]:
         await self._require_miembro(proyecto_id, usuario_id)
         miembros = await self.miembros.list_by_proyecto(proyecto_id)
-        return [MiembroProyectoResponse.model_validate(m) for m in miembros]
+
+        # ------------------------------------------------------------------
+        # Tanda B23: el embebido solo trae id_usuario — sin el join, un
+        # LECTOR/EDITOR no-ADMIN veía "Usuario 6aee4aad…" en el modal
+        # (GET /usuarios/{id} también es ADMIN-o-el-propio). Resolvemos
+        # nombre/email en UNA consulta $in y poblamos los campos
+        # opcionales de la respuesta; si un usuario ya no existe, quedan
+        # None y el cliente muestra el id como antes.
+        # ------------------------------------------------------------------
+        usuarios = await self.usuarios.get_by_ids(
+            [m.id_usuario for m in miembros]
+        )
+        por_id = {u.id: u for u in usuarios}
+
+        respuesta: list[MiembroProyectoResponse] = []
+        for m in miembros:
+            item = MiembroProyectoResponse.model_validate(m)
+            u = por_id.get(m.id_usuario)
+            if u is not None:
+                item.nombre_usuario = u.nombre_completo
+                item.email_usuario = u.email
+            respuesta.append(item)
+        return respuesta
+
+    async def listar_candidatos(
+        self,
+        proyecto_id: PydanticObjectId,
+        *,
+        usuario_id: PydanticObjectId,
+        es_admin: bool = False,
+        buscar: Optional[str] = None,
+        limit: int = 20,
+    ) -> Sequence[UsuarioCandidatoResponse]:
+        """
+        Tanda B23: usuarios activos que pueden SER agregados al proyecto
+        (no son miembros aún). Repara el 403 del modal de miembros:
+        GET /usuarios es solo-ADMIN y el PROPIETARIO suele ser
+        DESARROLLADOR.
+
+        Permisos: PROPIETARIO del proyecto, o ADMIN de la plataforma (el
+        admin puede no ser miembro; _require_rol le daría 404, así que
+        el bypass se resuelve ANTES con la misma semántica de obtener()).
+        """
+        proyecto = await self.proyectos.get_by_id(proyecto_id)
+        if proyecto is None:
+            raise NotFoundError("Proyecto no encontrado")
+
+        if es_admin:
+            if proyecto.miembro(usuario_id) is None:
+                # El admin no-miembro ve el proyecto igual (obtener() lo
+                # permite); aquí solo hace falta que exista.
+                pass
+        else:
+            proyecto = await self._require_rol(
+                proyecto_id, usuario_id, roles=("PROPIETARIO",)
+            )
+
+        excluir = [m.id_usuario for m in proyecto.miembros]
+        candidatos = await self.usuarios.buscar_candidatos(
+            excluir_ids=excluir, buscar=buscar, limit=limit
+        )
+        return [UsuarioCandidatoResponse.model_validate(u) for u in candidatos]
 
     async def agregar_miembro(
         self,

@@ -34,6 +34,8 @@ import logging
 import re
 from typing import Any, Optional
 
+from app.utils.identificadores import filtrar_identificadores_redundantes
+
 from app.ai_vision.sketch_recognition import (
     CajaDetectada,
     LineaDetectada,
@@ -97,6 +99,15 @@ class UMLReconstructor:
 
         for i, caja in enumerate(deteccion.cajas):
             clase = self._parsear_caja(caja, indice=i, advertencias=advertencias)
+            # Tanda B25: si el boceto trajo `id` + `id<Clase>` (la IA a
+            # veces agrega el id "por convención"), descartamos el
+            # redundante ANTES de devolverlo al cliente — así el
+            # duplicado jamás entra al diagrama ni al export/generador.
+            clase["atributos"] = filtrar_identificadores_redundantes(
+                clase["atributos"],
+                clase["nombre"],
+                extraer_nombre=lambda a: a.get("nombre", ""),
+            )
             clases.append(clase)
             caja_a_nombre[id(caja)] = clase["nombre"]
 

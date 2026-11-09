@@ -63,6 +63,7 @@ from app.repositories.intercambio_repository import (
     ImportacionRepository,
 )
 from app.repositories.proyecto_repository import MiembroProyectoRepository
+from app.utils.identificadores import filtrar_identificadores_redundantes
 from app.schemas.intercambio_schema import (
     ExportacionDiagramaResponse,
     ExportacionResultado,
@@ -307,7 +308,15 @@ class IntercambioService:
             resumen["clases_insertadas"] += 1
 
             # 2.1) Atributos de la clase
-            for i, attr_data in enumerate(clase_data.get("atributos", [])):
+            # Tanda B25: un XMI hecho a mano en EA puede traer id +
+            # id<Clase>; se descarta el redundante al importar, igual
+            # que en visión/REST/Agente (misma regla compartida).
+            atributos_filtrados = filtrar_identificadores_redundantes(
+                list(clase_data.get("atributos", [])),
+                nombre,
+                extraer_nombre=lambda a: (a.get("nombre") or "").strip(),
+            )
+            for i, attr_data in enumerate(atributos_filtrados):
                 attr = AtributoUML(
                     nombre=(attr_data.get("nombre") or "").strip(),
                     tipo_dato=attr_data.get("tipo_dato") or "String",

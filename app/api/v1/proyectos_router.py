@@ -37,6 +37,7 @@ from app.schemas.proyecto_schema import (
     ProyectoCreate,
     ProyectoResponse,
     ProyectoUpdate,
+    UsuarioCandidatoResponse,
 )
 from app.services.auditoria_service import AuditoriaService
 from app.services.proyecto_service import ProyectoService
@@ -206,6 +207,33 @@ async def listar_miembros(
 ):
     service = ProyectoService()
     return await service.listar_miembros(proyecto_id, usuario_id=current_user.id)
+
+
+@router.get(
+    "/{proyecto_id}/candidatos",
+    response_model=list[UsuarioCandidatoResponse],
+    summary="Listar candidatos a miembro (PROPIETARIO o ADMIN) — Tanda B23",
+    description=(
+        "Usuarios ACTIVOS que aún NO son miembros del proyecto, con búsqueda "
+        "opcional por nombre o email (`buscar`). Repara el 403 del modal de "
+        "miembros: `GET /usuarios` es solo-ADMIN y el PROPIETARIO suele ser "
+        "DESARROLLADOR. Devuelve lo mínimo para el selector con buscador."
+    ),
+)
+async def listar_candidatos(
+    proyecto_id: PydanticObjectId,
+    buscar: str | None = Query(None, max_length=150, description="Texto a buscar en nombre o email"),
+    limit: int = Query(20, ge=1, le=50),
+    current_user: Usuario = Depends(get_current_active_user),
+):
+    service = ProyectoService()
+    return await service.listar_candidatos(
+        proyecto_id,
+        usuario_id=current_user.id,
+        es_admin=current_user.is_admin,
+        buscar=buscar,
+        limit=limit,
+    )
 
 
 @router.post(

@@ -82,6 +82,37 @@ class MiembroProyectoResponse(MiembroProyectoBase):
     # Sin id ni id_proyecto: el miembro va EMBEBIDO en el proyecto
     joined_at: datetime
 
+    # ------------------------------------------------------------------
+    # Tanda B23: datos VISUALES del usuario resueltos por el service al
+    # listar miembros (join en memoria contra la colección usuarios).
+    # Opcionales y nulables: el embebido NO los almacena; si el service
+    # no pudo resolverlos (usuario borrado), quedan None y el cliente
+    # muestra el id (comportamiento anterior).
+    # ------------------------------------------------------------------
+    nombre_usuario: Optional[str] = None
+    email_usuario: Optional[str] = None
+
+
+# ======================================================================
+# Tanda B23 — Candidatos a miembro (GET /proyectos/{id}/candidatos)
+# ======================================================================
+# Repara el 403 del modal de miembros: GET /usuarios es solo-ADMIN, así
+# que un PROPIETARIO con rol global DESARROLLADOR no podía listar
+# usuarios para elegir a quién invitar. Este endpoint es POR PROYECTO:
+# exige ser PROPIETARIO del proyecto (o ADMIN de la plataforma) y
+# devuelve SOLO usuarios activos que AÚN no son miembros — lo mínimo
+# que el selector con buscador necesita, sin exponer el padrón completo.
+RolGlobal = Literal["ADMIN", "LIDER", "DESARROLLADOR"]
+
+
+class UsuarioCandidatoResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: PydanticObjectId
+    nombre_completo: str
+    email: str
+    rol: RolGlobal
+
 
 # ======================================================================
 # Compuestos (para respuestas anidadas cómodas)

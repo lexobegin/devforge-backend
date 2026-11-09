@@ -1,7 +1,6 @@
 # app/api/v1/generacion_router.py
 """
-Endpoints del módulo F. Generación Automática de Backend (Spring Boot)
-— CICLO 2.
+Endpoints del módulo F. Generación Automática de Código — CICLO 2.
 
 - POST   /api/v1/generacion/diagramas/{id}/generar       → disparar generación
 - GET    /api/v1/generacion/trabajos/{trabajo_id}        → ver detalle
@@ -11,13 +10,24 @@ Endpoints del módulo F. Generación Automática de Backend (Spring Boot)
 - GET    /api/v1/generacion/trabajos/{trabajo_id}/archivo   → descargar ZIP
 
 CICLO 2 (reconvertido del Ciclo 1, cambios documentados):
-- SIN AsyncSessionLocal ni BackgroundTasks: GeneratorService.generar_backend()
-  (Tanda 18) ejecuta el pipeline COMPLETO en la llamada (gate → mapeo →
-  render → ZIP → embebidos → EXITOSO) y devuelve el trabajo terminado;
-  por eso el POST responde 200 OK y no 202+polling. El endpoint /estado
-  se conserva por compatibilidad.
-- package_base/nombre_proyecto/incluir_postman de GenerarBackendRequest
-  se mapean directo al service (package_base va por constructor).
+- SIN AsyncSessionLocal ni BackgroundTasks: los services ejecutan el
+  pipeline COMPLETO en la llamada (gate → mapeo/render → ZIP → embebidos
+  → EXITOSO) y devuelven el trabajo terminado; por eso el POST responde
+  200 OK y no 202+polling. El endpoint /estado se conserva por compatibilidad.
+- TANDA B21 (CU24): el POST /generar hace DISPATCH por `stack_destino`
+  (el Ciclo 1 ya traía el campo en GenerarBackendRequest para eso):
+    * SPRING_BOOT_JPA_POSTGRES (default) → GeneratorService.generar_backend
+      (package_base va por constructor, incluir_postman y nombre_proyecto
+      aplican).
+    * REACT_TS_VITE → GeneradorFrontendService.generar_frontend (CU24,
+      Tanda 17: proyecto React + Vite + TS con CRUD por clase). Los
+      campos package_base e incluir_postman NO aplican al stack frontend
+      y se ignoran (documentado aquí; el modelo Pydantic los acepta
+      porque el request es compartido).
+  El resto de rutas (detalle/estado/historial/descarga/archivo) son
+  AGNÓSTICAS del stack: leen TrabajoGeneracionCodigo sin importar el
+  valor de stack_destino, y obtener_ruta_zip valida EXITOSO +
+  pertenencia + archivo (sirve el ZIP de ambos stacks).
 - Las consultas (detalle/estado/historial) usan el TrabajoGeneracionRepository
   sin estado + verificación de pertenencia (mismo criterio del módulo C:
   ajeno → 404 genérico "Recurso no encontrado").
@@ -32,6 +42,7 @@ from fastapi.responses import FileResponse
 from app.config import settings
 from app.core.dependencies import get_current_active_user
 from app.core.exceptions import NotFoundError
+from app.models.generacion import TrabajoGeneracionCodigo
 from app.models.usuario import Usuario
 from app.repositories.diagrama_repository import DiagramaRepository
 from app.repositories.generacion_repository import TrabajoGeneracionRepository
@@ -55,13 +66,16 @@ router = APIRouter()
 @router.post(
     "/diagramas/{diagrama_id}/generar",
     response_model=TrabajoGeneracionCodigoResponse,
-    summary="Generar el backend Spring Boot del diagrama",
+    summary="Generar el código del diagrama (backend Spring Boot o frontend React)",
     description=(
-        "Ciclo 2: el pipeline completo corre en la llamada (gate formal → "
-        "mapeo UML→Java/SQL → render de plantillas → ZIP → resultado "
-        "embebido) y responde con el trabajo en estado EXITOSO (o lanza el "
-        "error de dominio correspondiente). El fallo de render/escritura "
-        "deja el trabajo FALLIDO y relanza la excepción original."
+        "Ciclo 2: el pipeline completo corre en la llamada y responde con "
+        "el trabajo en estado EXITOSO (o lanza el error de dominio "
+        "correspondiente). Tanda B21: el dispatch la decide `stack_destino` "
+        "— SPRING_BOOT_JPA_POSTGRES genera el backend Java (package_base / "
+        "incluir_postman aplican) y REACT_TS_VITE genera el frontend React "
+        "CRUD (CU24; package_base / incluir_postman se ignoran). El fallo "
+        "de render/escritura deja el trabajo FALLIDO y relanza la "
+        "excepción original."
     ),
 )
 async def generar_backend(
@@ -69,19 +83,35 @@ async def generar_backend(
     datos: GenerarBackendRequest,
     current_user: Usuario = Depends(get_current_active_user),
 ) -> TrabajoGeneracionCodigoResponse:
-    # Import local para evitar dependencia circular en tiempo de import
-    # (code_generator → utils.validators → …)
-    from app.code_generator.generator_service import GeneratorService
+    """Tanda B21: dispatch por stack_destino. El nombre de la función se
+    conserva (firma pública de la Tanda 19; el arnés la inspecciona)."""
+    trabajo: TrabajoGeneracionCodigo
+    if datos.stack_destino == "REACT_TS_VITE":
+        # Import local para evitar dependencia circular en tiempo de import
+        # (services → code_generator.templates_react → …)
+        from app.services.generador_frontend_service import (
+            GeneradorFrontendService,
+        )
 
-    service = GeneratorService(
-        package_base=datos.package_base,
-    )
-    trabajo = await service.generar_backend(
-        current_user.id,
-        diagrama_id,
-        incluir_postman=datos.incluir_postman,
-        nombre_proyecto=datos.nombre_proyecto,
-    )
+        trabajo = await GeneradorFrontendService().generar_frontend(
+            current_user.id,
+            diagrama_id,
+            nombre_proyecto=datos.nombre_proyecto,
+        )
+    else:
+        # Import local para evitar dependencia circular en tiempo de import
+        # (code_generator → utils.validators → …)
+        from app.code_generator.generator_service import GeneratorService
+
+        service = GeneratorService(
+            package_base=datos.package_base,
+        )
+        trabajo = await service.generar_backend(
+            current_user.id,
+            diagrama_id,
+            incluir_postman=datos.incluir_postman,
+            nombre_proyecto=datos.nombre_proyecto,
+        )
 
     # Bitácora de trabajo creado (la de EXITOSO/FALLIDO ya la escribe el
     # service con las firmas del Ciclo 2)
@@ -123,14 +153,20 @@ async def obtener_trabajo(
 
     await _require_miembro_de_trabajo(trabajo, current_user)
 
-    # EntidadesGeneradas vive EMBEBIDA en el documento (entidades_generadas);
-    # el response la expone como `entidades` — se arma explícito.
+    # EntidadesGeneradas vive EMBEBIDA en el documento (entidades); el
+    # response la expone como `entidades` — se arma explícito.
+    # FIX B21: la T19 leía `trabajo.entidades_generadas` (nombre de la
+    # tabla del Ciclo 1) → AttributeError disfrazado de 500 en
+    # GET /trabajos/{id} para CUALQUIER trabajo EXITOSO con resultado
+    # embebido (el E2E de la T19 solo probó el 404 de ajeno, nunca un
+    # detalle EXITOSO). El campo del modelo Ciclo 2 es `entidades`
+    # (app/models/generacion.py: entidades: list[EntidadGenerada]).
     base = TrabajoGeneracionCodigoResponse.model_validate(trabajo)
     return TrabajoGeneracionDetalleResponse(
         **base.model_dump(),
         entidades=[
             EntidadGeneradaResponse.model_validate(e)
-            for e in (trabajo.entidades_generadas or [])
+            for e in (trabajo.entidades or [])
         ],
     )
 
@@ -192,10 +228,11 @@ async def listar_trabajos(
 @router.get(
     "/trabajos/{trabajo_id}/descargar",
     response_model=DescargaProyectoResponse,
-    summary="Obtener URL de descarga del backend generado",
+    summary="Obtener URL de descarga del proyecto generado (backend o frontend)",
     description=(
         "Devuelve la URL pública desde la que se puede descargar el ZIP. "
-        "Requiere que el trabajo esté en estado EXITOSO."
+        "Requiere que el trabajo esté en estado EXITOSO. Agnóstico del "
+        "stack (B21)."
     ),
 )
 async def obtener_url_descarga(
@@ -208,7 +245,6 @@ async def obtener_url_descarga(
     # obtener_ruta_zip valida trabajo EXITOSO + pertenencia + archivo
     ruta = await service.obtener_ruta_zip(trabajo_id, usuario_id=current_user.id)
 
-    trabajo = await TrabajoGeneracionRepository().get_by_id(trabajo_id)
     return DescargaProyectoResponse(
         id_trabajo=trabajo_id,
         download_url=(
@@ -216,7 +252,16 @@ async def obtener_url_descarga(
             f"{settings.API_V1_PREFIX}/generacion/trabajos/{trabajo_id}/archivo"
         ),
         tamanio_bytes=ruta.stat().st_size if ruta.is_file() else None,
-        incluye_postman=bool(trabajo and trabajo.incluye_postman),
+        # FIX B21: la T19 leía trabajo.incluye_postman (columna del Ciclo 1
+        # que el documento Ciclo 2 NO tiene) → AttributeError disfrazado de
+        # 500 en /descargar para CUALQUIER trabajo EXITOSO. El dato honesto
+        # se lee del propio ZIP: la colección vive en backend/postman/*.json
+        # (T18); el frontend React nunca la trae.
+        incluye_postman=_zip_trae_postman(ruta),
+        # Tanda B22: nombre real del ZIP (el frontend lo usa como nombre de
+        # descarga; antes inventaba devforge-backend-<id>.zip para ambos
+        # stacks).
+        nombre_archivo=ruta.name if ruta.is_file() else None,
     )
 
 
@@ -245,6 +290,28 @@ async def descargar_zip(
 # ======================================================================
 # Helpers de pertenencia (mismo criterio del módulo C / Tanda 18)
 # ======================================================================
+def _zip_trae_postman(ruta_zip: Path) -> bool:
+    """FIX B21: el documento Ciclo 2 no guarda incluye_postman (era
+    columna del Ciclo 1). El dato real está en el ZIP: la colección
+    Postman se escribe en backend/postman/*.postman_collection.json
+    (generator_service T18) cuando el pedido la incluyó; el ZIP del
+    frontend React nunca la trae. Ante cualquier lectura imposible se
+    responde False (nunca rompe la descarga)."""
+    import zipfile
+
+    if not ruta_zip.is_file():
+        return False
+    try:
+        with zipfile.ZipFile(ruta_zip) as paquete:
+            return any(
+                "postman" in nombre.lower()
+                for nombre in paquete.namelist()
+            )
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+
 async def _require_miembro_de_trabajo(trabajo, current_user: Usuario) -> None:
     """Ajeno → 404 genérico (no revela trabajos de otros proyectos)."""
     diagrama = await DiagramaRepository().get_by_id(trabajo.id_diagrama)

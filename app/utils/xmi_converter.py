@@ -96,6 +96,7 @@ from typing import Any, Optional
 from xml.etree import ElementTree as ET
 
 from app.core.exceptions import BadRequestError
+from app.utils.identificadores import filtrar_identificadores_redundantes
 from app.utils.validators import validar_multiplicidad
 
 
@@ -256,7 +257,17 @@ def _clase_a_xml(parent: ET.Element, clase: Any) -> None:
 
     clase_el = ET.SubElement(parent, "Class", attrib=atrs)
 
-    for attr in getattr(clase, "atributos", []) or []:
+    # Tanda B25: al exportar a EA, un `id` + `id<Clase>` del diagrama
+    # (diagramas viejos o dibujados a mano) sale como DOS identificadores
+    # en Enterprise Architect. Se descarta el redundante en el vuelo
+    # (el diagrama NO se modifica).
+    atributos = filtrar_identificadores_redundantes(
+        list(getattr(clase, "atributos", []) or []),
+        clase.nombre,
+        extraer_nombre=lambda a: getattr(a, "nombre", ""),
+    )
+
+    for attr in atributos:
         ET.SubElement(
             clase_el,
             "Attribute",
@@ -1322,7 +1333,14 @@ def _clase_a_xml_ea(parent: ET.Element, clase: Any, xmi_id: str) -> None:
 
     if clase.atributos or clase.operaciones:
         feature = ET.SubElement(class_el, "UML:Classifier.feature")
-        for attr in clase.atributos:
+        # Tanda B25: mismo filtro que el formato devforge — el duplicado
+        # id+id<Clase> no viaja a Enterprise Architect.
+        atributos = filtrar_identificadores_redundantes(
+            list(clase.atributos),
+            clase.nombre,
+            extraer_nombre=lambda a: getattr(a, "nombre", ""),
+        )
+        for attr in atributos:
             attr_el = ET.SubElement(feature, "UML:Attribute", attrib={
                 "name": attr.nombre,
                 "visibility": _vis_a_xmi(attr.visibilidad),
